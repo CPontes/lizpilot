@@ -25,7 +25,9 @@ from openpilot.selfdrive.hexa import live as hexa_live
 from openpilot.selfdrive.hexa import marks as hexa_marks
 from openpilot.selfdrive.hexa import mdns as hexa_mdns
 from openpilot.selfdrive.hexa import missions as hexa_missions
+from openpilot.selfdrive.hexa import nav as hexa_nav
 from openpilot.selfdrive.hexa import radars
+from openpilot.selfdrive.hexa import share as hexa_share
 from openpilot.selfdrive.hexa import phone
 from openpilot.selfdrive.hexa import timeline
 from openpilot.selfdrive.hexa import updates
@@ -95,6 +97,7 @@ MAX_PROFILES = 6
 MAX_PROFILE_NAME = 20
 GZIP_MIN_BYTES = 16 * 1024  # segments kept in memory
 SERVE_RETRY = 5.  # s between tries when the port can't be opened
+SHARE_EVERY_S = 20.  # the share worker's turn: one cut or one send
 SECURITY_HEADERS = {
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff",
@@ -114,7 +117,9 @@ class PanelBackend:
                live_state: Callable[[], dict] | None = None, radar_path: Path | None = None,
                gps_fix: Callable[[], tuple[float, float, float, float] | None] | None = None,
                health_state: Callable[[], dict] | None = None,
-               summarize: Callable[[dict], dict] = timeline.trip_summary, spawn: Callable[[Callable[[], None]], None] | None = None):
+               summarize: Callable[[dict], dict] = timeline.trip_summary, spawn: Callable[[Callable[[], None]], None] | None = None,
+               sharer: hexa_share.Sharer | None = None,
+               navigator: hexa_nav.Navigator | None = None, route_state: Callable[[], dict] | None = None):
     self.store = store  # Params, or anything with get/put/get_bool/put_bool/remove
     self._vehicle_state = vehicle_state
     self.clock = clock  # wall clock: token, audit and mark dates
@@ -155,6 +160,9 @@ class PanelBackend:
     self._sync_lock = threading.Lock()
     self._trip_sigs: dict[str, tuple[str, int]] = {}
     self._trip_gen = 0
+    self.sharer = sharer  # sending a mark's moment to the developers (selfdrive/hexa/share.py)
+    self.navigator = navigator or hexa_nav.Navigator(store)  # where to go: openpilot's own navigation takes it from there
+    self._route_state = route_state or (lambda: {"active": False})
 
   def vehicle_state(self) -> VehicleState:
     with self._vs_lock:
@@ -1200,6 +1208,84 @@ class PanelBackend:
       self._audit({"event": "phone_revoked", "who": who.get("name", ""), "new": gone.get("name", "")})
     return 200, {"ok": True}
 
+  # *** sending a mark's moment to the developers (selfdrive/hexa/share.py): only what the owner picks ***
+
+  def share_state(self) -> dict:
+    if self.sharer is None:
+      return {"enabled": False, "receiver": False, "items": [], "forgetting": False, "sent": 0}
+    with self.lock:
+      return self.sharer.state()
+
+  def share_add(self, who: dict, mark_id: str, with_note: bool = False) -> tuple[int, dict]:
+    if self.sharer is None:
+      return 404, {"error": "Este comma não envia trechos."}
+    with self.lock:
+      mark = next((m for m in self._marks() if m.get("id") == mark_id), None)
+      if mark is None:
+        return 404, {"error": "Marca não encontrada."}
+      status, out = self.sharer.enqueue(mark, with_note=with_note)
+      if status == 200:
+        self._audit({"event": "share_queued", "who": who.get("name", ""), "new": mark_id})
+      return status, out
+
+  def share_cancel(self, who: dict, mark_id: str) -> tuple[int, dict]:
+    if self.sharer is None:
+      return 404, {"error": "Este comma não envia trechos."}
+    with self.lock:
+      return self.sharer.cancel(mark_id)
+
+  def share_forget(self, who: dict) -> tuple[int, dict]:
+    if self.sharer is None:
+      return 404, {"error": "Este comma não envia trechos."}
+    with self.lock:
+      self._audit({"event": "share_forget", "who": who.get("name", "")})
+      return self.sharer.forget()
+
+  def share_step(self, network_ok: bool) -> str:
+    """The worker's turn (main(), every SHARE_EVERY_S). The cut reads the logs outside the lock: only the queue is locked."""
+    if self.sharer is None:
+      return "nada"
+    with self.lock:
+      marks = [dict(m) for m in self._marks()]
+    return self.sharer.step(offroad=not self.vehicle_state().onroad, network_ok=network_ok, marks=marks)
+
+  # *** the route: the phone picks the destination, openpilot's navigation (navd) does the rest. It never changes the driving ***
+
+  def nav_state(self) -> dict:
+    n = self.navigator
+    return {"enabled": n.enabled(), "destination": n.destination(), "places": n.places(),
+            "token": bool(self.store.get(hexa_nav.TOKEN_PARAM)), "route": self._route_state()}
+
+  def _nav(self, fn) -> tuple[int, dict]:
+    try:
+      out = fn()
+    except hexa_nav.NavError as e:
+      return 400, {"error": str(e)}
+    return 200, {"ok": True, **(out or {})}
+
+  def nav_search(self, who: dict, query: str) -> tuple[int, dict]:
+    return self._nav(lambda: {"results": self.navigator.search(query)})
+
+  def nav_go(self, who: dict, body: dict) -> tuple[int, dict]:
+    status, out = self._nav(lambda: {"destination": self.navigator.go(body.get("latitude"), body.get("longitude"), body.get("name", ""))})
+    if status == 200:
+      self._audit({"event": "nav_go", "who": who.get("name", "")})  # not where: the audit is read on the phones
+    return status, out
+
+  def nav_stop(self, who: dict) -> tuple[int, dict]:
+    return self._nav(lambda: self.navigator.stop())
+
+  def nav_place(self, who: dict, body: dict) -> tuple[int, dict]:
+    return self._nav(lambda: {"places": self.navigator.save_place(body.get("name"), body.get("latitude"), body.get("longitude"))})
+
+  def nav_place_remove(self, who: dict, name: str) -> tuple[int, dict]:
+    return self._nav(lambda: {"places": self.navigator.remove_place(name)})
+
+  def nav_token(self, who: dict, token) -> tuple[int, dict]:
+    if self.vehicle_state().onroad:
+      return 409, {"error": "Só com o carro desligado."}
+    return self._nav(lambda: {"token": self.navigator.set_token(token)})
+
   def logout(self, who: dict) -> tuple[int, dict]:
     with self.lock:
       self.store.put(phone.TOKENS_PARAM, phone.revoke_token(self._tokens(), who.get("id", "")))
@@ -1376,6 +1462,14 @@ def make_handler(backend: PanelBackend):
       elif path == "/api/health":
         if self._who() is not None:
           self._json(200, backend.health())
+      elif path == "/api/share":
+        who = self._who()
+        if who is not None:
+          self._json(200, backend.share_state())
+      elif path == "/api/nav":
+        who = self._who()
+        if who is not None:
+          self._json(200, backend.nav_state())
       elif path == "/api/phones":
         who = self._who()
         if who is not None:
@@ -1416,6 +1510,15 @@ def make_handler(backend: PanelBackend):
         "/api/phones/revoke": lambda who, b: backend.revoke_phone(who, str(b.get("id", ""))),
         "/api/comma/set": lambda who, b: backend.comma_set(who, str(b.get("key", "")), b.get("value")),
         "/api/comma/action": lambda who, b: backend.comma_action(who, str(b.get("action", ""))),
+        "/api/share": lambda who, b: backend.share_add(who, str(b.get("id", "")), b.get("with_note") is True),
+        "/api/share/cancel": lambda who, b: backend.share_cancel(who, str(b.get("id", ""))),
+        "/api/share/forget": lambda who, b: backend.share_forget(who),
+        "/api/nav/search": lambda who, b: backend.nav_search(who, str(b.get("q", ""))),
+        "/api/nav/go": lambda who, b: backend.nav_go(who, b),
+        "/api/nav/stop": lambda who, b: backend.nav_stop(who),
+        "/api/nav/place": lambda who, b: backend.nav_place(who, b),
+        "/api/nav/place/remove": lambda who, b: backend.nav_place_remove(who, str(b.get("name", ""))),
+        "/api/nav/token": lambda who, b: backend.nav_token(who, b.get("token", "")),
       }
       if path not in routes and path != "/api/logout":
         self._json(404, {"error": "Não encontrado."})
@@ -1460,7 +1563,7 @@ def main():
   params = Params()
   sm = messaging.SubMaster(["deviceState", "carState", "selfdriveState", "carControl", "carOutput", "radarState", "gpsLocationExternal",
                             "onroadEvents", "drivingModelData", "driverMonitoringState", "managerState", "lateralTorqueParameters",
-                            "vehicleParameters", "lateralDelay", "peripheralState"])
+                            "vehicleParameters", "lateralDelay", "peripheralState", "navInstruction", "navRoute"])
 
   def vehicle_state() -> VehicleState:
     sm.update(0)
@@ -1508,10 +1611,40 @@ def main():
       return None
     return g.latitude, g.longitude, g.bearingDeg, g.speed
 
+  def route_state() -> dict:
+    with nav_lock:
+      sm.update(0)
+      alive = sm.recv_frame["navInstruction"] > 0 and time.monotonic() - sm.recv_time["navInstruction"] < 5 and sm.valid["navInstruction"]
+      pts = [(c.latitude, c.longitude) for c in sm["navRoute"].coordinates] if sm.recv_frame["navRoute"] > 0 else []
+      return hexa_nav.route_view(sm["navInstruction"], pts, alive)
+
+  def car_position() -> tuple[float, float] | None:
+    fix = gps_fix()
+    return (fix[0], fix[1]) if fix is not None else None
+
+  nav_lock = threading.Lock()
   from openpilot.common.hardware.hw import Paths
+  from openpilot.selfdrive.hexa import edition
   backend = PanelBackend(params, vehicle_state, log_event=lambda fields: cloudlog.event("hexa_mark", **fields),
                          log_root=Paths.log_root(), live_state=live_state, radar_path=radars.updated_path(), gps_fix=gps_fix,
-                         health_state=health_state)
+                         health_state=health_state, navigator=hexa_nav.Navigator(params, position=car_position), route_state=route_state,
+                         sharer=hexa_share.Sharer(params, Paths.log_root(), edition=edition.EDITION,
+                                                  offroad=lambda: not backend.vehicle_state().onroad))  # the car on stops a cut
+
+  def share_worker():
+    # one cut or one send at a time, car off for the cut, a network that isn't metered for the send
+    net = messaging.SubMaster(["deviceState"])
+    while True:
+      time.sleep(SHARE_EVERY_S)
+      try:
+        net.update(0)
+        ds = net["deviceState"]
+        network_ok = net.recv_frame["deviceState"] > 0 and str(ds.networkType) != "none" and not ds.networkMetered
+        done = backend.share_step(network_ok)
+        if done not in ("nada", "desligado", "esperando rede"):
+          cloudlog.info(f"hexaweb: share {done}")
+      except Exception:
+        cloudlog.exception("hexaweb: share worker")
 
   def watch_bookmarks():
     # every bookmark in the log becomes a mark: with the reason from the phone, or "sem motivo" to classify later
@@ -1523,6 +1656,7 @@ def main():
       backend.on_drive_state(watched["selfdriveState"].enabled, watched["onroadEvents"])
 
   threading.Thread(target=watch_bookmarks, daemon=True).start()
+  threading.Thread(target=share_worker, daemon=True).start()
   threading.Thread(target=hexa_mdns.serve, daemon=True).start()  # lizpilot.local on the local network
   serve(backend)
 
