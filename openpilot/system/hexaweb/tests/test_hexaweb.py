@@ -1656,3 +1656,132 @@ def test_each_drive_keeps_its_clock_from_its_last_read_minute(panel, tmp_path):
   panel.json("/api/trips", token=token)
   jobs.pop()()
   assert panel.store.get(hexaweb.SUMMARY_PARAM)["0000000f--8784034901"]["t0"] == 840. - 70.
+
+
+# *** sending a mark's moment to the developers (selfdrive/hexa/share.py) ***
+
+def _sharing_panel(panel, tmp_path, enabled=True):
+  from openpilot.selfdrive.hexa import share
+  sent = []
+
+  def post(url, body, hdrs):
+    sent.append(url)
+    return 201, {"id": "s1"}
+  panel.backend.sharer = share.Sharer(panel.store, str(tmp_path / "realdata"), url="https://r.example", post=post, clock=lambda: panel.now,
+                                      cutter=lambda *a, **k: (b"cut", {"services": {"carState": 1}}), share_dir=tmp_path / "share",
+                                      send_jitter_s=0.)
+  panel.store.put(share.ENABLED_PARAM, enabled)
+  from opendbc.car.structs import car
+  panel.store.put("CarParamsPersistent", car.CarParams.new_message(brand="gwm", carFingerprint="GWM_HAVAL_H6").to_bytes())  # only the Haval
+  return sent
+
+
+def test_share_needs_a_paired_phone(panel, tmp_path):
+  _sharing_panel(panel, tmp_path)
+  assert panel.json("/api/share")[0] == 401
+  assert panel.json("/api/share", {"id": "x"})[0] == 401
+  assert panel.json("/api/share/forget", {})[0] == 401
+
+
+def test_share_a_mark_from_the_phone(panel, tmp_path):
+  sent = _sharing_panel(panel, tmp_path)
+  token = panel.pair()
+  status, body = panel.json("/api/mark", {"reason": "curva"}, token)
+  mark_id = body["mark"]["id"]
+  assert panel.json("/api/share", {"id": "nope"}, token)[0] == 404
+  status, body = panel.json("/api/share", {"id": mark_id}, token)
+  assert status == 200 and body["item"]["state"] == "fila"
+  assert panel.store.get("HexaWebAudit")[-1]["event"] == "share_queued"
+  assert panel.backend.share_step(network_ok=True) == "cortado"
+  assert panel.backend.share_step(network_ok=True) == "enviado" and sent[-1].endswith("/v1/share")
+  status, state = panel.json("/api/share", token=token)
+  assert status == 200 and state["enabled"] and state["receiver"] and state["sent"] == 1
+  assert state["items"][0]["id"] == mark_id and state["items"][0]["state"] == "enviado"
+
+
+def test_share_is_not_cut_with_the_car_on(panel, tmp_path):
+  _sharing_panel(panel, tmp_path)
+  token = panel.pair()
+  mark_id = panel.json("/api/mark", {"reason": "curva"}, token)[1]["mark"]["id"]
+  panel.json("/api/share", {"id": mark_id}, token)
+  panel.vs = VehicleState(onroad=True)
+  assert panel.backend.share_step(network_ok=True) == "nada"
+
+
+def test_share_off_says_where_to_turn_it_on(panel, tmp_path):
+  _sharing_panel(panel, tmp_path, enabled=False)
+  token = panel.pair()
+  mark_id = panel.json("/api/mark", {"reason": "curva"}, token)[1]["mark"]["id"]
+  status, body = panel.json("/api/share", {"id": mark_id}, token)
+  assert status == 409 and "Ajustes" in body["error"]
+
+
+def test_share_cancel_and_forget(panel, tmp_path):
+  _sharing_panel(panel, tmp_path)
+  token = panel.pair()
+  mark_id = panel.json("/api/mark", {"reason": "curva"}, token)[1]["mark"]["id"]
+  panel.json("/api/share", {"id": mark_id}, token)
+  assert panel.json("/api/share/cancel", {"id": mark_id}, token) == (200, {"ok": True})
+  assert panel.json("/api/share", token=token)[1]["items"] == []
+  panel.json("/api/share", {"id": mark_id}, token)
+  assert panel.json("/api/share/forget", {}, token) == (200, {"ok": True})
+  assert panel.json("/api/share", token=token)[1]["items"] == []
+
+
+def test_a_comma_without_sharing_answers_plainly(panel):
+  token = panel.pair()
+  assert panel.json("/api/share", token=token) == (200, {"enabled": False, "receiver": False, "items": [], "forgetting": False, "sent": 0})
+  assert panel.json("/api/share", {"id": "x"}, token)[0] == 404
+
+
+# *** the route from the phone (selfdrive/hexa/nav.py) ***
+
+def _nav_panel(panel, results=None):
+  from openpilot.selfdrive.hexa import nav
+  urls = []
+
+  def get(url):
+    urls.append(url)
+    return results if results is not None else [{"lat": "-22.9035", "lon": "-43.1092", "display_name": "Icaraí, Niterói"}]
+  panel.backend.navigator = nav.Navigator(panel.store, get_json=get, mono=lambda: panel.now)
+  panel.store.put("NavigationEnabled", True)
+  return urls
+
+
+def test_nav_needs_a_paired_phone(panel):
+  _nav_panel(panel)
+  assert panel.json("/api/nav")[0] == 401
+  assert panel.json("/api/nav/go", {"latitude": -22.9, "longitude": -43.1})[0] == 401
+
+
+def test_nav_search_go_save_and_stop(panel):
+  urls = _nav_panel(panel)
+  token = panel.pair()
+  status, body = panel.json("/api/nav/search", {"q": "icaraí"}, token)
+  assert status == 200 and body["results"][0]["name"] == "Icaraí, Niterói" and len(urls) == 1
+  place = body["results"][0]
+  assert panel.json("/api/nav/go", {**place}, token)[0] == 200
+  state = panel.json("/api/nav", token=token)[1]
+  assert state["enabled"] and state["destination"]["place_name"] == "Icaraí, Niterói" and state["route"] == {"active": False}
+  assert panel.store.get("HexaWebAudit")[-1]["event"] == "nav_go" and "Icaraí" not in str(panel.store.get("HexaWebAudit")[-1])
+  assert panel.json("/api/nav/place", {**place, "name": "Praia"}, token)[1]["places"][0]["name"] == "Praia"
+  assert panel.json("/api/nav/stop", {}, token) == (200, {"ok": True})
+  assert panel.json("/api/nav", token=token)[1]["destination"] is None
+  assert panel.json("/api/nav/place/remove", {"name": "praia"}, token)[1]["places"] == []
+
+
+def test_nav_go_while_driving_is_allowed_it_doesnt_change_the_driving(panel):
+  _nav_panel(panel)
+  token = panel.pair()
+  panel.vs = VehicleState(onroad=True, parked=False, standstill=False, engaged=True)
+  assert panel.json("/api/nav/go", {"latitude": -22.9, "longitude": -43.1, "name": "x"}, token)[0] == 200
+  assert panel.json("/api/nav/token", {"token": "pk." + "a" * 30}, token)[0] == 409  # the key only with the car off
+
+
+def test_nav_errors_are_the_phones(panel):
+  _nav_panel(panel)
+  token = panel.pair()
+  panel.store.put("NavigationEnabled", False)
+  status, body = panel.json("/api/nav/go", {"latitude": -22.9, "longitude": -43.1}, token)
+  assert status == 400 and "navegação" in body["error"]
+  assert panel.json("/api/nav/search", {"q": "a"}, token)[0] == 400
