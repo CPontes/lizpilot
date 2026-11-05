@@ -1,0 +1,1040 @@
+"""The phone panel's decisions (static/lp-logic.js), run in node: what the band says, what the comma card claims,
+the speed bump messages and the passenger question. Skipped where node isn't installed (the comma itself)."""
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+LOGIC = Path(__file__).parents[1] / "static" / "lp-logic.js"
+NODE = shutil.which("node") or next((p for p in ("/opt/node22/bin/node", "/usr/local/bin/node") if Path(p).exists()), None)
+pytestmark = pytest.mark.skipif(NODE is None, reason="node not installed")
+
+
+def run(fn: str, *args):
+  script = f"const L = require({json.dumps(str(LOGIC))}); process.stdout.write(JSON.stringify(L[{json.dumps(fn)}](...{json.dumps(args)})));"
+  out = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout
+  return json.loads(out)
+
+
+T0 = 1_000_000
+NOW = {"online": True, "age": 500, "now": T0}
+DRIVING = {"driving": True, "v": 62, "steering": True, "engaged": True, "driver": False, "acc": True, "acc_active": True, "acc_set": 70,
+           "alert": "", "alert_status": "normal", "why": []}
+
+
+def live(**kw):
+  return {**DRIVING, **kw}
+
+
+def at(ms):
+  return {**NOW, "now": T0 + ms}
+
+
+# ----- the band
+
+def test_openpilot_driving_with_the_acc_in_control():
+  b = run("band", live(), NOW)
+  assert b["cls"] == "op" and b["who"] == "openpilot dirigindo" and b["acc"] == 70
+
+
+def test_acc_number_only_with_the_acc_in_control():
+  assert run("band", live(acc_active=False), NOW)["acc"] is None
+  assert run("band", live(acc_active=None), NOW)["acc"] is None
+  assert run("band", live(acc_set=None), NOW)["acc"] is None
+  assert run("band", live(steering=False), NOW)["acc"] == 70  # the driver steering with the ACC on
+
+
+def test_steering_only_needs_2_s_moving():
+  first = run("band", live(acc_active=False), NOW)
+  assert first["cls"] == "op" and first["who"] == "openpilot na direção" and first["latSince"] == T0  # foot on the gas: not yet
+  assert run("band", live(acc_active=False), at(1500), first["latSince"])["cls"] == "op"
+  b = run("band", live(acc_active=False), at(2000), first["latSince"])
+  assert b["cls"] == "lat" and b["who"] == "só direção · a velocidade é sua" and b["sub"] == "ACC desligado" and b["acc"] is None
+  back = run("band", live(), at(2500), b["latSince"])  # the ACC back in control resets it
+  assert back["cls"] == "op" and back["latSince"] is None
+
+
+def test_stopped_says_nothing_about_the_acc():
+  # [log] engaged with acc_active false is mostly stopped behind a car, held by the ACC (state 2)
+  b = run("band", live(v=0, acc_active=False), at(10_000), T0)
+  assert b["cls"] == "op" and b["who"] == "openpilot na direção" and b["acc"] is None and b["latSince"] is None
+  assert run("band", live(v=0), NOW)["who"] == "openpilot na direção"
+
+
+def test_unknown_acc_state_is_never_claimed():
+  assert run("band", live(acc_active=None), NOW)["who"] == "openpilot na direção"
+
+
+def test_alert_is_amber_and_critical_is_red():
+  assert run("band", live(alert="Steer Unavailable", alert_status="userPrompt"), NOW)["cls"] == "warn"
+  b = run("band", live(alert="TAKE CONTROL IMMEDIATELY", alert_status="critical"), NOW)
+  assert b["cls"] == "fail" and b["who"] == "assuma o volante" and b["sub"] == ""  # the alert below says why
+  # an older comma without the status: any alert text is at least amber, never green
+  assert run("band", live(alert="TAKE CONTROL IMMEDIATELY", alert_status=None), NOW)["cls"] == "warn"
+  assert run("band", live(alert="Pre-Enable", alert_status="normal"), NOW)["cls"] == "op"
+
+
+def test_no_connection_or_old_data_says_nothing_about_who_drives():
+  for link in ({"online": False, "age": 500, "now": T0}, {"online": True, "age": 5000, "now": T0}):
+    b = run("band", live(), link)
+    assert b["cls"] == "none" and b["who"] == "sem dados" and b["stale"] and b["acc"] is None
+  assert run("band", None, NOW)["cls"] == "none"
+
+
+def test_you_driving_and_why_it_does_not_engage():
+  b = run("band", live(steering=False, engaged=False, why=["pedal pisado"]), NOW)
+  assert b["cls"] == "you" and b["who"] == "você dirigindo" and b["sub"] == "não engata: {motivos}" and b["why"] == ["pedal pisado"]
+  assert run("band", {"driving": False}, NOW)["who"] == "carro desligado"
+
+
+def test_the_band_says_what_the_driver_took():
+  assert run("band", live(acc_active=True, v=60, gas=True), NOW)["sub"] == "você no acelerador"
+  assert run("band", live(acc_active=True, v=60, brake=True), NOW)["sub"] == "você no freio"
+  assert run("band", live(acc_active=True, v=60, driver=True), NOW)["sub"] == "você no volante"
+  assert run("band", live(acc_active=True, v=60, brake=True, gas=True), NOW)["sub"] == "você no freio"
+  assert run("band", live(acc_active=True, v=60), NOW)["sub"] == "volante ativo"
+  assert run("band", live(steering=False, gas=True), NOW)["sub"] == "openpilot desligado"  # nothing to take from
+
+
+# ----- the comma card, car off
+
+HEALTH = {"device": {"temp": 48, "thermal": "ok", "free": 57}, "down": [], "learned": {}, "commit": "abc1234"}
+
+
+def test_comma_ok_says_what_it_checked_and_never_that_the_car_is_ready():
+  c = run("commaChecks", True, HEALTH)
+  assert c["title"] == "Comma ok" and c["cls"] == "ok" and "câmeras" in c["sub"].lower()
+  assert "pronto" not in json.dumps(c, ensure_ascii=False).lower()
+  info = [i for i in c["items"] if i["ok"] is None]
+  assert {i["text"] for i in info} == {"Versão {versao}", "Aprendizado aparece depois de dirigir"}  # not checks
+
+
+def test_comma_temperature_follows_the_status_of_the_comma():
+  for thermal, ok in (("ok", True), ("overheated", False), ("critical", False)):
+    c = run("commaChecks", True, {**HEALTH, "device": {"temp": 69, "thermal": thermal, "free": 57}})
+    assert next(i["ok"] for i in c["items"] if "{graus}" in i["text"]) is ok
+
+
+def test_comma_problems():
+  c = run("commaChecks", True, {**HEALTH, "down": ["modeld"], "device": {"temp": 80, "thermal": "overheated", "free": 4}})
+  assert c["title"] == "Atenção no comma" and c["cls"] == "att"
+  assert [i["ok"] for i in c["items"] if i["ok"] is not None] == [False, False, False]
+  assert run("commaChecks", False, HEALTH)["title"] == "Sem dados do comma"
+  assert run("commaChecks", True, None)["items"] == []
+
+
+# ----- lane text
+
+def test_centimeters_only_with_both_lines():
+  assert run("laneText", {"left": -1.2, "right": 1.86, "left_ok": True, "right_ok": True}) == {"text": "Na faixa · {cm} cm à esquerda", "vars": {"cm": 33}}
+  assert run("laneText", {"left": -1.2, "right": 1.86, "left_ok": True, "right_ok": False})["text"] == "Só a linha da esquerda está visível"
+  assert run("laneText", {"left": -1.5, "right": 1.52, "left_ok": True, "right_ok": True})["text"] == "No centro da faixa"
+
+
+def test_each_option_says_when_it_applies():
+  assert run("applies", {"restart_needed": True}) == "Vale na próxima partida do carro."
+  assert run("applies", {"restart_needed": False}) == "Vale no próximo engate."
+
+
+# ----- speed bump
+
+def test_bump_offers_to_keep_the_speed_it_was_passed_at():
+  c = run("speedChoices", "lombada", 22, None)
+  assert [x["v"] for x in c] == [None, 22, 10, 15, 20, 25, 30, 40, 50] and c[1]["label"] == "Manter {n}"
+  assert [x["v"] for x in run("speedChoices", "lombada", 90, 35)] == [None, 10, 15, 20, 25, 30, 35, 40, 50]  # 90 is not a bump speed
+  assert [x["v"] for x in run("speedChoices", "radar", 50, None)][-1] == 120
+  assert run("keptSpeed", "lombada", 22) == 22 and run("keptSpeed", "lombada", 3) is None and run("keptSpeed", "radar", 22) is None
+
+
+ON = {"alert": True, "slowdown": False, "long": False, "calibrated": False}
+
+
+def test_bump_message_by_speed_never_says_the_car_slows_where_nothing_does():
+  assert run("bumpMessage", 40, ON) == "Hoje só avisa. Ligue reduzir na lombada em Ajustes."
+  assert run("bumpMessage", 30, {**ON, "slowdown": True}) == "Em teste: o comma toca o − do ACC até essa velocidade."
+  assert run("bumpMessage", 20, ON).startswith("O ACC da Haval não vai abaixo de 30 km/h.")
+  assert run("bumpMessage", 20, {**ON, "slowdown": True}).startswith("O ACC da Haval não vai abaixo de 30 km/h.")
+  assert run("bumpMessage", 20, {**ON, "long": True}).startswith("O longitudinal do comma ainda não foi testado")
+  assert run("bumpMessage", 20, {**ON, "alert": False}).startswith("Com o aviso de radar e lombada desligado")
+  assert run("bumpMessage", None, ON) == ""
+
+
+# ----- the passenger question
+
+def test_passenger_question():
+  parked, moving, off = {"on": True, "moving": False}, {"on": True, "moving": True}, {"on": False, "moving": False}
+  assert run("passenger", {"ok": False}, parked) == {"ok": False, "ask": False}  # parked: never asks
+  assert run("passenger", {"ok": False}, moving) == {"ok": False, "ask": True}   # moving, not confirmed
+  assert run("passenger", {"ok": True}, moving) == {"ok": True, "ask": False}    # moving, confirmed
+  assert run("passenger", {"ok": True}, parked)["ok"] is True                    # stopping in traffic keeps it
+  gone = run("passenger", {"ok": True}, off)                                     # turning the car off ends it
+  assert gone == {"ok": False, "ask": False}
+  assert run("passenger", gone, moving)["ask"] is True                           # next trip asks once again
+
+
+# ----- the fixed address
+
+def test_fixed_address_plan():
+  assert run("addressPlan", "lizpilot.local", False, True) == "fixed"
+  assert run("addressPlan", "LizPilot.local", True, False) == "fixed"
+  assert run("addressPlan", "192.168.0.23", True, False) == "move"   # not paired: go there before the code
+  assert run("addressPlan", "192.168.0.23", True, True) == "offer"   # paired by address: suggest, pairs again once
+  assert run("addressPlan", "192.168.0.23", False, True) == "ip"     # the name doesn't answer here
+
+
+# ----- who had the wheel
+
+SUMMARY = {"moving_s": 31 * 60, "op_s": 23 * 60, "help_s": 3 * 60, "you_s": 5 * 60, "stop_s": 6 * 60,
+           "op_km": 23.4, "help_km": 2.1, "you_km": 3.5, "km": 29.0, "acc_s": 27 * 60}
+
+
+def test_trip_split_in_minutes_km_and_shares():
+  t = run("tripSplit", SUMMARY)
+  assert [(p["key"], p["min"], p["km"]) for p in t["parts"]] == [("op", 23, 23.4), ("help", 3, 2.1), ("you", 5, 3.5)]
+  assert abs(sum(p["pct"] for p in t["parts"]) - 100) < .01
+  assert t["big"] == {"text": "{m} min", "vars": {"m": 23}} and t["line"] == "de volante por conta do openpilot"
+  assert t["sub"]["vars"] == {"ajudou": 3, "dirigiu": 5, "parado": 6} and "Parado" in t["sub"]["text"]
+  assert t["accPct"] == 87 and t["short"]["vars"] == {"op": 23, "andando": 31}
+
+
+def test_trip_split_when_you_drove_and_without_data():
+  t = run("tripSplit", {**SUMMARY, "op_s": 10, "help_s": 0, "you_s": 31 * 60, "stop_s": 0, "acc_s": 0})
+  assert t["line"] == "você dirigiu nesta viagem" and t["big"]["vars"] == {"m": 31} and t["accPct"] is None
+  assert "Parado" not in t["sub"]["text"]
+  assert run("tripSplit", None) is None and run("tripSplit", {"moving_s": 0}) is None
+
+
+def test_week_total_is_a_sum_of_the_last_7_days():
+  now = 1_800_000_000
+  trips = [{"mtime": now - 3600, "summary": SUMMARY}, {"mtime": now - 86400, "summary": SUMMARY},
+           {"mtime": now - 8 * 86400, "summary": SUMMARY}, {"mtime": now - 60, "summary": None}]
+  w = run("weekTotal", trips, now)
+  assert w["trips"] == 2 and abs(w["km"] - 58.0) < .01 and w["op"] == {"text": "{m} min", "vars": {"m": 46}}
+  assert run("duration", 130) == {"text": "{h} h {m} min", "vars": {"h": 2, "m": 10}}
+  assert run("weekTotal", [], now) is None
+
+
+def test_week_shadow_adds_up_drives_that_have_it():
+  now = 1_800_000_000
+  sh = {"sh_on_s": 600., "sh_hard": 2, "sh_earlier": 1, "sh_weaker": 1, "sh_fcw": 0, "sh_gap_s": 300., "sh_gap_t": 200.}
+  trips = [{"mtime": now - 3600, "summary": {**SUMMARY, **sh}}, {"mtime": now - 7200, "summary": {**SUMMARY, **sh, "sh_gap_s": 150., "sh_gap_t": 100.}},
+           {"mtime": now - 60, "summary": SUMMARY}, {"mtime": now - 9 * 86400, "summary": {**SUMMARY, **sh}}]
+  w = run("weekShadow", trips, now)
+  assert (w["hard"], w["earlier"], w["weaker"], w["trips"], w["minutes"]) == (4, 2, 2, 2, 20)
+  assert abs(w["gap"] - 1.5) < 1e-9  # time-weighted: 450 / 300
+  assert run("weekShadow", [{"mtime": now, "summary": SUMMARY}], now) is None  # older summaries don't have it
+  assert run("gapMeters", 1.45, 60) == 24
+
+
+def test_week_car_takes_maxima_minima_and_rates():
+  now = 1_800_000_000
+  a = {**SUMMARY, "km": 20., "se_grade_up": 8.2, "se_grade_down": 4., "se_v12_min": 12.3,
+       "se_decel": 3.1, "se_lat": 2.4, "se_roll": 3., "se_wheel_s": 120., "se_wheel_t": 100.}
+  b = {**SUMMARY, "km": 10., "se_grade_up": 11.5, "se_grade_down": 6.5, "se_v12_min": 12.6,
+       "se_decel": 2.0, "se_lat": 1.0, "se_roll": 5., "se_wheel_s": 0., "se_wheel_t": 0.}
+  w = run("weekCar", [{"mtime": now - 60, "summary": a}, {"mtime": now - 120, "summary": b}, {"mtime": now - 9 * 86400, "summary": a}], now)
+  assert (w["up"], w["down"], w["v12"], w["decel"], w["roll"]) == (11.5, 6.5, 12.3, 3.1, 5)
+  assert abs(w["wheels"] - 1.2) < 1e-9
+  assert run("weekCar", [{"mtime": now, "summary": SUMMARY}], now) is None
+
+
+# ----- Viagens: totals and versions (owner's decisions on the sweep, 02/11)
+
+def test_totals_add_every_drive_with_a_summary_and_give_rates_from_1_km():
+  trips = [{"mtime": 100, "summary": {"km": 30., "moving_s": 1800, "op_s": 1500, "off": 3, "alerts": 6}},
+           {"mtime": 200, "summary": {"km": 20., "moving_s": 1200, "op_s": 600, "off": 2, "alerts": 0}},
+           {"mtime": 300, "summary": None}]
+  t = run("totals", trips, 0)
+  assert t["trips"] == 2 and t["km"] == 50. and t["opPct"] == 70 and t["off"] == 5
+  assert t["per100"] == {"off": 10., "alerts": 12.}
+  assert run("totals", trips, 150)["trips"] == 1
+  assert run("totals", [{"mtime": 1, "summary": {"km": .4, "moving_s": 30, "op_s": 0, "off": 1}}], 0)["per100"] is None
+  assert run("totals", [], 0) is None
+
+
+def test_versions_newest_first_without_the_unknown():
+  trips = [{"summary": {"commit": "b2"}}, {"summary": {"commit": "a1"}}, {"summary": {"commit": "b2"}}, {"summary": {}}, {"summary": None}]
+  assert run("versions", trips) == ["b2", "a1"]
+  assert run("versionOf", {"summary": None}) == ""
+
+
+# ----- Início: the whole history, the map (owner, 02/11 01:53) and hidden drives (02:02)
+
+SAT = 1_793_448_000  # 2026-10-31 12:00 UTC, a Saturday
+
+
+def drive(end, minutes=20, **summary):
+  s = {"km": 12., "moving_s": 1000, "off": 0, "alerts": 0, **summary}
+  return {"id": f"r{end}", "mtime": end, "minutes": minutes, "summary": s, "hidden": False}
+
+
+def test_idle_drives_and_accents():
+  assert run("idle", drive(SAT, km=.1, moving_s=20)) is True
+  assert run("idle", drive(SAT, km=.1, moving_s=300)) is False  # a long time crawling is a drive
+  assert run("idle", {"mtime": SAT, "minutes": 1, "summary": None}) is False  # not read yet: never hidden for it
+  assert run("fold", "Sábado ÇÃO") == "sabado cao"
+
+
+def test_history_search_finds_day_time_version_and_marks():
+  a, b = drive(SAT, commit="abc1234"), drive(SAT - 86400 * 3, off=2, alerts=1)
+  marks = [{"t": SAT - 300, "text": "Curva fechada"}]
+  o = {"marks": marks, "locale": "pt-BR", "nowS": SAT + 3600, "words": {"today": "hoje", "yesterday": "ontem"}}
+
+  def ids(q, **kw):
+    return [t["id"] for t in run("history", [a, b], {**o, "query": q, **kw})["list"]]
+
+  assert ids("") == [a["id"], b["id"]]
+  assert ids("sabado") == [a["id"]] and ids("hoje") == [a["id"]] and ids("31/10") == [a["id"]]
+  assert ids("ABC12") == [a["id"]] and ids("curva") == [a["id"]] and ids("curva quarta") == []  # every word must be found
+  assert ids("quarta") == [b["id"]]
+  h = run("history", [a, b], {**o, "filter": "desengates"})
+  assert [t["id"] for t in h["list"]] == [b["id"]] and h["counts"] == {"todas": 2, "marcas": 1, "desengates": 1, "alertas": 1}
+  assert ids("", filter="nada") == [a["id"], b["id"]]
+
+
+def test_history_leaves_out_hidden_and_idle_drives_unless_asked():
+  shown, hid, still = drive(SAT), {**drive(SAT - 600), "hidden": True}, drive(SAT - 1200, km=0., moving_s=0)
+  h = run("history", [shown, hid, still], {})
+  assert [t["id"] for t in h["list"]] == [shown["id"]] and (h["hidden"], h["idle"]) == (1, 1)
+  assert len(run("history", [shown, hid, still], {"showHidden": True})["list"]) == 3
+
+
+def test_history_by_day():
+  days = run("byDay", [drive(SAT), drive(SAT - 3600, km=3.), drive(SAT - 86400)])
+  assert [(d["key"], len(d["trips"]), d["km"], d["minutes"]) for d in days] == [("2026-10-31", 2, 15., 40), ("2026-10-30", 1, 12., 20)]
+
+
+def test_map_fits_the_whole_path_and_lists_its_tiles():
+  assert run("mercator", 0, 0, 1) == [256, 256]
+  pts = [[1.0, 2.0, 0, 0], [1.01, 2.02, 3, 60], [1.005, 2.03, 1, 120]]
+  f = run("mapFit", pts, 360, 220, 18)
+  assert all(17.99 <= x <= 342.01 and 17.99 <= y <= 202.01 for x, y in f["xy"])  # the path touches the margin, never past it
+  bigger = run("mapFit", pts, 720, 440, 18)
+  assert bigger["z"] == f["z"] + 1  # twice the room, one zoom closer
+  tiles = run("mapTiles", f, 360, 220)
+  assert all(t["z"] == f["z"] for t in tiles) and min(t["left"] for t in tiles) <= 0 and max(t["left"] + t["size"] for t in tiles) >= 360
+  xs, ys = [x for x, _ in f["xy"]], [y for _, y in f["xy"]]
+  assert 256 <= f["size"] < 512 and max(max(xs) - min(xs), max(ys) - min(ys)) > 160  # fills the box
+  assert run("mapFit", [[1.0, 2.0, 0, 0]], 360, 220, 18)["z"] == 17  # a single point: close in, not the world
+  assert run("mapFit", [], 360, 220, 18) is None
+  assert run("nearestAt", pts, 70) == 1
+
+
+def test_trip_numbers_like_a_trip_computer():
+  n = run("tripNumbers", {"km": 30., "moving_s": 1800, "stop_s": 300, "v_max": 98.4, "run_km": 12.34, "run_s": 600})
+  assert (n["avg"], n["vmax"], n["runKm"], n["runMin"], n["movingMin"], n["stopMin"]) == (60, 98, 12.34, 10, 30, 5)
+  old = run("tripNumbers", {"km": .5, "moving_s": 40})
+  assert old["avg"] is None and old["vmax"] is None and old["runKm"] is None  # too short for an average; older summaries
+  assert run("tripNumbers", None) is None
+
+
+def test_weekly_trend_leaves_hidden_and_idle_drives_out():
+  now = SAT  # a Saturday: the week started on Monday 26/10
+  trips = [drive(now, km=20., moving_s=1000, op_s=800, off=1), drive(now - 3 * 86400, km=10., moving_s=1000, op_s=200),
+           {**drive(now - 3600, km=50.), "hidden": True}, drive(now - 7200, km=0., moving_s=0), drive(now - 8 * 86400, km=40., moving_s=2000, op_s=1000, off=2)]
+  w = run("weekly", trips, now, 3)
+  assert [x["trips"] for x in w] == [0, 1, 2]
+  assert w[2]["km"] == 30. and w[2]["opPct"] == 50 and abs(w[2]["off100"] - 100 / 30) < 1e-9
+  assert w[1]["off100"] == 5. and w[0]["opPct"] is None
+
+
+def summed(**kw):
+  return {"id": "a", "mtime": 1000, "minutes": 10, "hidden": False,
+          "summary": {"km": 10., "moving_s": 600., "op_s": 300., "off": 1, "alerts": 1, "sh_on_s": 60., "sh_hard": 1, "se_grade_up": 3.,
+                      **kw.pop("summary", {})}, **kw}
+
+
+def test_a_hidden_drive_leaves_the_sums_too():
+  shown, hidden, idle = summed(id="a"), summed(id="b", hidden=True), summed(id="c", summary={"km": .1, "moving_s": 10.})
+  trips = [shown, hidden, idle]
+  assert [t["id"] for t in run("listed", trips)] == ["a"]
+  assert run("weekTotal", trips, 1000)["trips"] == 1
+  assert run("totals", trips, 0)["trips"] == 1
+  assert run("weekShadow", trips, 1000)["trips"] == 1
+  assert run("totals", [hidden], 0) is None
+
+
+def test_a_row_finds_its_drive_in_the_list_of_now():
+  # the list is replaced on each refresh: the row may hold the object of an older one
+  old, new = {"id": "a", "hidden": False, "n": 1}, {"id": "a", "hidden": False, "n": 2}
+  assert run("currentTrip", [new], old)["n"] == 2
+  assert run("currentTrip", [], old)["n"] == 1
+
+
+def test_the_newest_marks_win_over_the_list_of_drives():
+  recent = [{"id": "1", "t": 10, "reason": "faixa"}]
+  older = [{"id": "1", "t": 10, "reason": ""}, {"id": "2", "t": 5, "reason": "outro"}]
+  got = run("mergeMarks", recent, older)
+  assert sorted(m["id"] for m in got) == ["1", "2"] and next(m for m in got if m["id"] == "1")["reason"] == "faixa"
+  assert run("mergeMarks", recent, None) == recent
+
+
+def test_the_pages_finish_what_hiding_a_drive_starts():
+  static = Path(__file__).parents[1] / "static"
+  html, trip = (static / "index.html").read_text(), (static / "viagens.html").read_text()
+  assert 'trip_hidden: "ocultou uma viagem"' in html and 'trip_shown: "mostrou uma viagem de novo"' in html
+  assert "Todas as viagens estão ocultas." in trip and "sel.options.length" in trip  # with all of them hidden it stayed on loading
+  assert "Desde sempre" not in html  # the sums only reach the drives whose logs are still on the comma
+
+
+def test_a_hard_brake_shows_on_its_trip_page():
+  trip = (Path(__file__).parents[1] / "static" / "viagens.html").read_text()
+  assert 'const SHOWN = ["mark", "off", "hardbrake"];' in trip and 'e.kind !== "mark" && e.kind !== "off"' not in trip
+
+
+def test_unpairing_leaves_no_list_of_drives_on_the_phone():
+  html = (Path(__file__).parents[1] / "static" / "index.html").read_text()
+  assert 'if (!v) wipeBase(); }' in html  # APP-01: the whole copy leaves, not only the list
+  wipe = html[html.index("async function wipeBase()"):]
+  wipe = wipe[:wipe.index("\n}\n")]
+  assert "DB.clear()" in wipe and "await done" in wipe and "mQueue = []" in wipe  # the missions waiting for the comma too
+  assert "LPL.DATA_KEYS" in wipe and "trips = null" in wipe and "paths.clear()" in wipe
+  keys = subprocess.run([NODE, "-e", f"process.stdout.write(JSON.stringify(require({json.dumps(str(LOGIC))}).DATA_KEYS))"],
+                        capture_output=True, text=True, timeout=30, check=True).stdout
+  assert set(json.loads(keys)) == {"lpTrips", "lpMissionSnap", "lpCopEvents", "lpCopAnswers"}  # data only: the language and the view stay
+
+
+def test_no_path_yet_is_not_no_gps():
+  # right after an update the phone has summaries from its cache and the comma is still reading the drives
+  drive_read = {"summary": {"km": 5.}}
+  assert run("pathSettled", drive_read, 0) is True
+  assert run("pathSettled", drive_read, 12) is False
+  assert run("pathSettled", {"summary": None}, 0) is False
+
+
+def test_a_mark_finds_its_place_on_the_path_of_a_trimmed_drive():
+  # the path counts from minute 0 of the route, and the deleter may have taken the first minutes of the list
+  whole = {"mtime": 1000, "minutes": 10, "segments": list(range(10))}
+  trimmed = {"mtime": 1000, "minutes": 2, "segments": [8, 9]}
+  assert run("pathSecond", whole, 700) == 300  # 5 min into the drive
+  assert run("pathSecond", trimmed, 900) == 8 * 60 + 20  # 20 s into what's left, which starts at minute 8
+
+
+# ----- the KPIs (owner, 02/11 14:54): every number with its context
+
+def kdrive(end, **s):
+  base = {"km": 20., "moving_s": 1200, "op_s": 900, "off": 1, "driver": 1, "alerts": 2, "wob_ss": 400., "wob_n": 1000, "wob_s": 100.,
+          "lane_n": 100, "lane_ok": 90}
+  return {"id": f"k{end}", "mtime": end, "minutes": 25, "summary": {**base, **s}, "hidden": False}
+
+
+def test_kpi_of_a_set_of_drives():
+  k = run("kpiOf", [kdrive(SAT), kdrive(SAT - 3600, km=10., off=0, driver=0)])
+  assert "kmPerInt" not in k  # a hand on the wheel isn't an intervention (CTO review of 05)
+  assert abs(k["opPct"] - 75) < 1e-9 and abs(k["wobble"] - (800 / 2000) ** .5) < 1e-9
+  assert k["lanePct"] == 90 and abs(k["alerts100"] - 400 / 30) < 1e-9
+  thin = run("kpiOf", [kdrive(SAT, km=.5, moving_s=20, wob_s=12., lane_n=3)])
+  assert thin["opPct"] is None and thin["wobble"] is None and thin["lanePct"] is None  # under 30 s of straight: no wobble
+  old = run("kpiOf", [kdrive(SAT, wob_s=None)])
+  assert old["wobble"] is None  # a summary from before the straights-only wobble measured curves
+  assert run("kpiOf", [{**kdrive(SAT), "hidden": True}])["trips"] == 0
+
+
+def test_kpis_trend_says_better_or_worse_the_right_way():
+  now = [kdrive(SAT - 86400 * i, wob_ss=200.) for i in range(3)]
+  before = [kdrive(SAT - 86400 * (30 + i), wob_ss=400.) for i in range(3)]
+  k = run("kpis", now + before, SAT + 60, 28)
+  assert k["wobble"]["trend"] == 1  # less wobble: better
+  assert k["opPct"]["trend"] == 0 and k["alerts100"]["trend"] == 0  # the same: about the same
+  worse = run("kpis", [kdrive(SAT, alerts=9), kdrive(SAT - 3600, alerts=9)] + before, SAT + 60, 28)
+  assert worse["alerts100"]["trend"] == -1
+  thin = run("kpis", [kdrive(SAT, km=12.)] + before, SAT + 60, 28)  # 12 km in 4 weeks: no number, no arrow
+  assert thin["now"]["few"] and thin["now"]["opPct"] is None and thin["opPct"] is None
+
+
+def test_version_compare_says_nothing_under_the_minimum():
+  trips = [kdrive(SAT, commit="b2", wob_ss=200.), kdrive(SAT - 7200, commit="b2", wob_ss=200.), kdrive(SAT - 86400, commit="a1")]
+  v = run("versionCompare", trips)
+  assert (v["now"], v["before"]) == ("b2", "a1") and v["few"] is True
+  assert v["better"] is None and v["judged"] is None and all(r["delta"] is None for r in v["rows"])  # the numbers, no verdict
+  row = next(r for r in v["rows"] if r["key"] == "wobble")
+  assert row["now"] < row["before"]
+  many = [kdrive(SAT - 3600 * i, commit="b2", km=25., wob_ss=200.) for i in range(9)] + [kdrive(SAT - 86400 * (2 + i), commit="a1", km=25.) for i in range(9)]
+  v = run("versionCompare", many)
+  assert not v["few"] and v["judged"] >= 1 and v["better"] >= 1
+  assert run("versionCompare", [kdrive(SAT, commit="b2")]) is None
+
+
+def test_version_compare_is_against_the_last_tested():  # owner, 03/11: several updates went out untested
+  rel = [{"commit": c} for c in ("e5", "d4", "c3", "b2", "a1")]
+  trips = [kdrive(SAT, commit="e5"), kdrive(SAT - 3600, commit="d4", km=5.), kdrive(SAT - 86400, commit="b2", km=40.),
+           kdrive(SAT - 2 * 86400, commit="a1", km=300.)]
+  v = run("versionCompare", trips, rel)
+  assert (v["now"], v["before"]) == ("e5", "b2")  # d4 had a 5 km drive: not tested
+  assert v["between"] == ["c3"] and v["short"] == ["d4"] and v["b"]["km"] == 40  # d4's 5 km: on neither side, and said so
+  only_short = [kdrive(SAT, commit="e5"), kdrive(SAT - 3600, commit="d4", km=5.)]
+  assert run("versionCompare", only_short, rel)["before"] == "d4"  # nothing tested: the last with any drive
+  assert run("versionCompare", trips, None)["between"] is None  # no notes yet: nothing to name
+  back = [kdrive(SAT, commit="e5"), kdrive(SAT - 86400, commit="b2", km=40.), kdrive(SAT - 7 * 86400, commit="d4", km=300.)]
+  v = run("versionCompare", back, rel)  # went back to b2 yesterday after d4 last week
+  assert v["before"] == "b2" and v["between"] == ["c3"] and v["short"] == [] and v["earlier"] == ["d4"]
+  assert run("versionCompare", trips + [kdrive(SAT + 60, commit="zz")], rel)["between"] is None  # a version the notes don't know
+
+
+def test_a_drive_against_its_average():
+  trips = [kdrive(SAT - 86400 * i) for i in range(1, 4)]
+  me = kdrive(SAT, wob_ss=100.)
+  v = run("tripVsAverage", me, trips + [me], SAT + 60)
+  assert v["wobble"]["word"] == "melhor que a sua média" and v["opPct"]["word"] == "na sua média" and "kmPerInt" not in v
+
+
+# ----- missions
+
+def _m(key, how, total=1, done=0, lock="", **kw):
+  return {"key": key, "trail": "a", "title": key.capitalize(), "total": total, "how": how, "done": done, "lock": lock, **kw}
+
+
+CAT = {"levels": [[0, "Garagem"], [.5, "Cidade"], [1, "Pronta"]], "trails": [{"key": "a", "title": "A"}],
+       "missions": [_m("lento", "auto", detect="slow10"), _m("noite", "auto", detect="night30"),
+                    _m("inst", "auto", detect="installed", arg="b3ac6fe"), _m("fila", "marca", 3, 1),
+                    _m("portas", "parado", 4), _m("aeb", "cto", lock="Só no log")]}
+
+
+def trip(km=10, moving=900, slow=0, commit="a635314", hour_end=12, hidden=False):
+  import datetime
+  end = datetime.datetime(2026, 11, 2, hour_end, 0).timestamp()
+  return {"mtime": end, "minutes": round(moving / 60), "hidden": hidden,
+          "summary": {"km": km, "moving_s": moving, "slow_s": slow, "commit": commit, "v_max": 60, "marks": 0}}
+
+
+def test_missions_seen_in_the_summaries_and_never_from_a_mark():
+  st = {"active": ["fila"], "answers": {"portas": 2}, "pending": [{"key": "fila", "mark": "x", "t": 1}, {"key": "fila", "mark": "y", "t": 2}]}
+  p = run("missionProgress", CAT, st, [trip(slow=650, commit="b3ac6fe1234")])
+  assert p["lento"]["full"] and p["inst"]["full"] and not p["noite"]["full"]
+  assert p["fila"]["d"] == 1 and p["fila"]["toCheck"] == 2 and p["fila"]["active"]  # marks wait for the CTO
+  assert p["portas"]["d"] == 2 and p["aeb"]["locked"]
+  assert not run("missionProgress", CAT, st, [trip(slow=650, hidden=True)])["lento"]["full"]  # a hidden drive doesn't count
+  assert run("missionProgress", CAT, st, [trip(moving=1900, hour_end=21)])["noite"]["full"]
+  assert not run("missionProgress", CAT, st, [trip(moving=1200, hour_end=21)])["noite"]["full"]
+
+
+def test_the_level_and_what_moved_after_a_drive():
+  before = run("missionProgress", CAT, {}, [])
+  after = run("missionProgress", CAT, {"pending": [{"key": "fila"}]}, [trip(slow=650, commit="b3ac6fe")])
+  lv = run("missionLevel", CAT, after)
+  assert lv["n"] == 2 and lv["i"] == 0 and lv["next"] == {"name": "Cidade", "left": 1}
+  moved = {d["key"]: d for d in run("missionDiff", before, after)}
+  assert set(moved) == {"lento", "inst", "fila"} and moved["fila"]["checks"] == 1 and moved["lento"]["full"]
+  order = [m["key"] for m in run("missionOrder", CAT["missions"], after)]
+  assert order[0] == "fila" and order[-2:] == ["lento", "inst"] and order.index("aeb") > order.index("portas")
+  tr = run("missionTrails", CAT, after)[0]
+  assert tr["d"] == 2 and tr["next"] == "Fila" and not tr["seal"]
+
+
+# ----- the phone's own copy (APP-01)
+
+def ctrip(i, km=1., hidden=False):
+  return {"id": i, "mtime": 100, "summary": {"km": km}, "hidden": hidden}
+
+
+def test_copy_nothing_new_keeps_everything():
+  base = {"trips": [ctrip("b"), ctrip("a")], "marks": [{"id": "m1"}], "v": "v1"}
+  out = run("applyTrips", base, {"same": True, "v": "v1"})
+  assert out == {"trips": base["trips"], "marks": base["marks"], "v": "v1"}
+
+
+def test_copy_a_delta_replaces_only_the_drive_that_changed_and_keeps_the_comma_order():
+  base = {"trips": [ctrip("b"), ctrip("a")], "marks": [{"id": "m1"}], "v": "v1"}
+  out = run("applyTrips", base, {"delta": True, "trips": [ctrip("c"), ctrip("a", 9.)], "ids": ["c", "b", "a"], "hidden": ["b"], "v": "v2"})
+  assert [t["id"] for t in out["trips"]] == ["c", "b", "a"] and out["trips"][2]["summary"]["km"] == 9.
+  assert [t["hidden"] for t in out["trips"]] == [False, True, False]
+  assert out["marks"] == [{"id": "m1"}] and out["v"] == "v2" and out["missing"] == 0  # no marks in the answer: the copy's stay
+
+
+def test_copy_a_drive_the_comma_deleted_leaves_and_new_marks_replace():
+  base = {"trips": [ctrip("b"), ctrip("a")], "marks": [{"id": "m1"}], "v": "v1"}
+  out = run("applyTrips", base, {"delta": True, "trips": [], "ids": ["b"], "hidden": [], "marks": [{"id": "m2"}], "v": "v2"})
+  assert [t["id"] for t in out["trips"]] == ["b"] and out["marks"] == [{"id": "m2"}]
+
+
+def test_copy_cut_short_asks_for_the_whole_list():
+  out = run("applyTrips", {"trips": [ctrip("a")], "v": "v1"}, {"delta": True, "trips": [], "ids": ["z", "a"], "hidden": [], "v": "v2"})
+  assert out["missing"] == 1
+
+
+def test_copy_a_whole_answer_replaces_it():
+  out = run("applyTrips", {"trips": [ctrip("a")], "marks": [{"id": "m1"}], "v": "v1"}, {"trips": [ctrip("x")], "marks": [], "v": "v9"})
+  assert [t["id"] for t in out["trips"]] == ["x"] and out["marks"] == [] and out["v"] == "v9"
+  assert run("applyTrips", None, None) == {"trips": [], "marks": [], "v": ""}
+
+
+def test_copy_marks_and_missions_whole_or_kept():
+  base = {"marks": [1], "v": "a"}
+  assert run("applyWhole", base, {"same": True, "v": "a"}) == base
+  assert run("applyWhole", base, {"marks": [2], "v": "b"}) == {"marks": [2], "v": "b"}
+  assert run("applyWhole", None, {"same": True, "v": "a"}) is None
+  assert run("since", "a.b.1") == "since=a.b.1" and run("since", "") == ""
+
+
+def test_copy_keeps_a_path_only_with_the_maps_option_on():  # owner, 03/11 (D2): off by default, and off keeps nothing
+  got = {"points": [[1, 2, 0, 0]], "v": "p1"}
+  assert run("keepPath", got, False) is None and run("keepPath", got, None) is None
+  assert run("keepPath", got, True) == got and run("keepPath", {"status": "none"}, True) is None
+
+
+def test_copy_read_only_without_the_comma_or_before_its_first_answer():
+  assert run("readOnly", True, False) is False
+  assert run("readOnly", False, False) is True and run("readOnly", True, True) is True
+
+
+# ----- the passenger's copilot (owner, 03/11)
+
+def test_copilot_reads_the_moment_from_the_live_data():
+  assert run("copilotMoment", None, 0) == [] and run("copilotMoment", {"driving": False}, 0) == []
+  assert run("copilotMoment", {"driving": True, "v": 0, "lead": None}, 5) == ["stop_free"]
+  assert run("copilotMoment", {"driving": True, "v": 0, "lead": {"d": 6}}, 90) == ["stop_queue", "stop_long"]
+  assert run("copilotMoment", {"driving": True, "v": 50, "lead": {"d": 30}}, 0) == ["moving", "city", "follow_mid"]
+  assert run("copilotMoment", {"driving": True, "v": 20, "lead": {"d": 10}}, 0) == ["moving", "city", "slow_follow"]
+  assert run("copilotMoment", {"driving": True, "v": 90, "lead": None}, 0) == ["moving"]  # the wheel test is for the city only
+
+
+def test_copilot_puts_what_fits_now_first_and_skips_what_is_done():
+  cat = {"missions": [_m("a", "marca", when="follow_mid"), _m("b", "marca", when="stop_free"), _m("c", "marca", when="stop_free"),
+                      _m("d", "marca"), _m("e", "cto", lock="x")]}
+  prog = run("missionProgress", cat, {}, [])
+  prog["c"]["full"] = True
+  order = run("copilotOrder", cat, ["a", "b", "c", "d", "e"], prog, ["stop_free"])
+  assert order == [{"key": "b", "fits": True}, {"key": "a", "fits": False}, {"key": "d", "fits": False}]
+
+
+def test_copilot_old_live_data_never_says_now():  # CTO review of app-08: 60 s old still said "Agora: … / Dá para fazer agora"
+  slow = {"driving": True, "v": 20, "lead": {"d": 10}}
+  assert run("copilotNow", slow, {"online": True, "age": 500}, 0) == {"state": "live", "moment": ["moving", "city", "slow_follow"]}
+  assert run("copilotNow", slow, {"online": True, "age": 60000}, 0) == {"state": "stale", "moment": [], "age": 60}
+  assert run("copilotNow", {"driving": False}, {"online": True, "age": 500}, 0) == {"state": "off", "moment": []}
+  assert run("copilotNow", None, {"online": True, "age": 500}, 0)["state"] == "none"
+  assert run("copilotNow", slow, {"online": False, "age": 500}, 0)["state"] == "none"
+
+
+def test_copilot_stop_clock_goes_on_through_an_old_tick():
+  stopped, moving = {"driving": True, "v": 0}, {"driving": True, "v": 30}
+  assert run("stopClock", None, stopped, False, 1000) == 1000
+  assert run("stopClock", 1000, stopped, False, 5000) == 1000
+  assert run("stopClock", 1000, stopped, True, 6000) == 1000  # one old tick: still stopped since 1000
+  assert run("stopClock", None, stopped, True, 6000) is None
+  assert run("stopClock", 1000, moving, False, 7000) is None and run("stopClock", 1000, {"driving": False}, False, 7000) is None
+
+
+def test_copilot_always_asks_the_passenger_and_closes_when_moving_without_one():
+  parked, moving, off = {"on": True, "moving": False}, {"on": True, "moving": True}, {"on": False, "moving": False}
+  assert run("copilotGate", {"ok": False}, parked) == {"ok": False, "ask": True, "close": False}  # parked too
+  assert run("copilotGate", {"ok": True}, parked) == {"ok": True, "ask": False, "close": False}
+  assert run("copilotGate", {"ok": False}, moving)["close"] is True
+  assert run("copilotGate", {"ok": True}, moving) == {"ok": True, "ask": False, "close": False}
+  assert run("copilotGate", {"ok": True}, off) == {"ok": False, "ask": True, "close": True}  # a new drive asks again
+  assert run("passenger", {"ok": False}, parked)["ask"] is False  # Marcar parked still asks nothing
+
+
+def test_copilot_keeps_what_was_answered_on_this_drive():
+  pend = [{"key": "a", "t": 50}, {"key": "b", "t": 150, "result": "bad"}, {"key": "c", "t": 160, "result": "ok"}, {"key": "c", "t": 170}]
+  assert run("tripAnswers", pend, 100) == {"b": "bad", "c": "done"}
+
+
+def test_a_mark_that_did_not_work_never_counts_as_progress():  # CTO review of app-08: "Não deu" showed as "1 missão avançou"
+  cat = {"missions": [_m("x", "marca", 3), _m("y", "marca", 1)]}
+  before = run("missionProgress", cat, {}, [])
+  st = {"pending": [{"key": "x", "result": "bad"}, {"key": "x", "result": "stop"}, {"key": "y", "result": "ok"}]}
+  after = run("missionProgress", cat, st, [])
+  assert after["x"]["toCheck"] == 0 and after["x"]["fails"] == 2 and after["y"]["toCheck"] == 1 and after["y"]["fails"] == 0
+  rows = {r["key"]: r for r in run("missionDiff", before, after)}
+  assert rows["x"]["moved"] is False and rows["x"]["fails"] == 2 and rows["x"]["checks"] == 0
+  assert rows["y"]["moved"] is True and rows["y"]["checks"] == 1
+  assert run("missionProgress", cat, {"pending": [{"key": "x"}]}, [])["x"]["toCheck"] == 1  # an older mark, no result: "Fiz agora"
+
+
+CAT_Q = {"max_active": 12, "route": {"key": "v1", "old": ["v0"]},
+         "missions": [_m("a", "marca"), _m("b", "auto"), _m("d", "parado", drive=True, route=2), _m("c", "marca", route=1),
+                                        _m("e", "marca", route=3, lock="x"), _m("f", "parado", route=4), _m("g", "marca", 2, route=5)]}
+
+
+def test_missions_chosen_away_from_the_comma_wait_in_order():  # owner, 03/11 (D3)
+  q = run("queueAdd", [], {"action": "take", "key": "a"})
+  q = run("queueAdd", q, {"action": "take", "key": "b"})
+  assert q == [{"action": "take", "key": "a"}, {"action": "take", "key": "b"}]
+  assert run("queueAdd", q, {"action": "take", "key": "a"}) == q  # twice: once
+  assert run("queueAdd", q, {"action": "drop", "key": "a"}) == [{"action": "take", "key": "b"}]  # taken and dropped: nothing to send
+  # the route goes after what was picked, once: a second one takes the first one's place at the end
+  assert run("queueAdd", q, {"action": "pack", "key": "v1"}) == q + [{"action": "pack", "key": "v1"}]
+  assert run("queueAdd", [{"action": "pack", "key": "v1"}, {"action": "take", "key": "a"}], {"action": "pack", "key": "v1"}) == \
+    [{"action": "take", "key": "a"}, {"action": "pack", "key": "v1"}]
+  for bad in ({"action": "answer", "key": "a"}, {"action": "mark", "key": "a"}, {"action": "take"}, None):  # only missions wait
+    assert run("queueAdd", q, bad) == q
+  after_pack = run("queueAdd", [{"action": "pack", "key": "v1"}], {"action": "drop", "key": "c"})
+  assert after_pack == [{"action": "pack", "key": "v1"}, {"action": "drop", "key": "c"}]
+
+
+def test_missions_waiting_show_on_top_of_the_comma_state():
+  st = {"active": ["a"], "answers": {}, "pending": []}
+  assert run("applyQueue", st, [{"action": "take", "key": "b"}, {"action": "drop", "key": "a"}], CAT_Q)["active"] == ["b"]
+  assert run("applyQueue", st, [{"action": "pack", "key": "v1"}], CAT_Q)["active"] == ["a", "c", "d", "g"]  # after what was picked, in order
+  assert run("applyQueue", dict(st, answers={"g": 2}), [{"action": "pack", "key": "v1"}], CAT_Q)["active"] == ["a", "c", "d"]  # answered: out
+  assert run("applyQueue", st, [], CAT_Q) == st
+  assert sorted(run("queuedKeys", [{"action": "pack", "key": "v1"}, {"action": "take", "key": "a"}], CAT_Q)) == ["a", "c", "d", "g"]
+  # what waits, as it will land: what the comma already has, or the answers took out, isn't "vai para o comma"
+  assert run("queuedKeys", [{"action": "pack", "key": "v1"}], CAT_Q, {"active": ["c"], "answers": {"g": 2}}) == ["d"]
+  assert run("applyQueue", st, [{"action": "pack", "key": "zzz"}], CAT_Q) == st  # the comma refuses a route it doesn't know
+  assert run("applyQueue", st, [{"action": "pack", "key": "v0"}], CAT_Q)["active"] == ["a", "c", "d", "g"]  # an old one is this one
+  full = {"active": [f"x{i}" for i in range(12)]}
+  assert run("applyQueue", full, [{"action": "take", "key": "a"}], CAT_Q) == full  # never past the 12 the comma takes
+  assert [m["key"] for m in CAT_Q["missions"] if run("canTake", m)] == ["a", "b", "d", "c", "g"]
+
+
+def test_the_phone_takes_the_same_missions_as_the_comma_and_the_same_results_count():
+  from openpilot.selfdrive.hexa import missions as M
+  pub = M.public()["missions"]
+  script = f"const L = require({json.dumps(str(LOGIC))}); const ms = {json.dumps(pub)};" + \
+    "process.stdout.write(JSON.stringify([ms.map(L.canTake), L.ADVANCED]));"
+  took, advanced = json.loads(subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout)
+  assert took == [M.can_take(m) for m in M.CATALOG] and took == [M.can_mark(m) for m in M.CATALOG]
+  assert advanced == list(M.ADVANCED) and set(M.RESULTS) == {"done", "ok", "bad", "stop"}
+
+
+def test_the_phone_counts_the_same_route_as_the_comma():
+  from openpilot.selfdrive.hexa import missions as M
+  cat = {k: v for k, v in M.public().items() if k in ("missions", "route")}
+  for answers in ({}, {"fila": 1}, {"parar-perto": 5, "sempre-ativa": 4}):
+    assert run("routeKeys", cat, answers) == M.route_keys(answers), answers
+    st = M.clean({"active": ["noite", "fila"], "answers": answers})
+    for key in (M.ROUTE_KEY, *M.OLD_ROUTES):
+      assert run("applyQueue", st, [{"action": "pack", "key": key}], cat)["active"] == M.take_pack(st, key)["active"], (answers, key)
+
+
+def test_the_history_tells_each_try_and_which_marks_it_checked():  # owner, 03/11
+  import time
+
+  def day(iso, h):
+    return int(time.mktime(time.strptime(f"{iso} {h}", "%Y-%m-%d %H:%M")))
+  m = _m("x", "marca", 3, 1, tries=[{"date": "2026-11-01", "route": "rota 16", "version": "a1", "result": "ok", "measured": "4 de 4"},
+                                    {"date": "2026-11-03", "route": "rota 31", "version": "b2", "result": "partial"}])
+  pend = [{"key": "x", "t": day("2026-11-01", "10:00"), "result": "ok"}, {"key": "x", "t": day("2026-11-03", "22:00"), "result": "bad"},
+          {"key": "x", "t": day("2026-11-04", "08:00"), "result": "done"}, {"key": "y", "t": 5}]
+  h = run("missionHistory", m, pend)
+  assert [x["route"] for x in h["tries"]] == ["rota 31", "rota 16"]  # newest first
+  assert [(x["result"], x["checked"]) for x in h["marks"]] == [("done", False), ("bad", True), ("ok", True)]
+  p = run("missionProgress", {"missions": [m]}, {"pending": pend}, [])["x"]
+  assert p["toCheck"] == 1 and p["fails"] == 0  # what a try checked waits for nothing
+  assert run("missionProgress", {"missions": [dict(m, tries=[])]}, {"pending": pend}, [])["x"]["toCheck"] == 2  # no try: all wait
+  # a reference measured before the change checks none; a try with an hour checks only up to it
+  base = dict(m, tries=[{"date": "2026-11-03", "result": "base"}])
+  assert [x["checked"] for x in run("missionHistory", base, pend)["marks"]] == [False, False, False]
+  timed = dict(m, tries=[{"date": "2026-11-03T12:00", "result": "ok"}])
+  assert [x["checked"] for x in run("missionHistory", timed, pend)["marks"]] == [False, False, True]
+
+
+def test_done_lists_what_was_checked_latest_first():
+  cat = {"missions": [_m("a", "marca", tries=[{"date": "2026-11-01", "result": "ok"}]), _m("b", "marca"), _m("c", "cto", 1, 1),
+                      _m("d", "marca", tries=[{"date": "2026-11-02", "result": "bad"}]), _m("e", "marca", tries=[{"date": "2026-11-03", "result": "base"}])]}
+  prog = run("missionProgress", cat, {}, [])
+  assert [m["key"] for m in run("missionsChecked", cat, prog)] == ["d", "a", "c"]  # a reference alone isn't done
+
+
+# ----- versions (owner, 03/11): fewer chips, every version on its own screen
+
+def test_version_chips_show_the_newest_few_and_how_many_more():
+  seen = ["f2", "a6", "3b", "00", "d5"]
+  assert run("versionChips", seen, None) == {"chips": [None, "f2", "a6", "3b"], "more": 2}
+  assert run("versionChips", seen, "d5") == {"chips": [None, "f2", "a6", "3b", "d5"], "more": 1}  # the one picked stays visible
+  assert run("versionChips", ["f2"], None) == {"chips": [None, "f2"], "more": 0}
+  assert run("versionChips", seen, "zz")["more"] == 2  # a pick its drives no longer show still counts what's hidden
+
+
+def test_version_list_has_the_notes_and_your_drives():
+  rel = [{"commit": "b2", "date": "03/11", "title": "Nova", "changes": ["x"]}, {"commit": "a1", "date": "02/11", "title": "Velha", "changes": ["y"]}]
+  trips = [kdrive(SAT, commit="b2"), kdrive(SAT - 3600, commit="b2"), kdrive(SAT - 7200, commit="zz9")]
+  out = run("versionList", trips, rel)
+  assert [r["commit"] for r in out] == ["b2", "a1", "zz9"]  # the channel's order, then what only the drives know
+  assert out[0]["trips"] == 2 and out[0]["km"] == 40 and out[0]["before"] == "a1"
+  assert out[1]["trips"] == 0 and out[1]["before"] is None and out[2]["title"] is None
+
+
+# ----- the copilot's events (owner, 03/11): what just happened, with the time it was read
+
+def run_drive(samples, st=None, t0=0):
+  """samples: (seconds, live) in order; returns every event fired and the updates, by running eventStep like the page does."""
+  script = f"""const L = require({json.dumps(str(LOGIC))}); let st = null; const evs = [], ups = [];
+  for (const [s, l] of {json.dumps(samples)}) {{ const r = L.eventStep(st, l, {t0} + s * 1000); st = r.st; evs.push(...r.events); ups.push(...r.updates); }}
+  process.stdout.write(JSON.stringify({{ evs, ups }}));"""
+  out = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout
+  return json.loads(out)
+
+
+def car(v, lead=None, **kw):
+  return {"driving": True, "v": v, "engaged": True, "steering": True, "lead": lead, "blinker": "", **kw}
+
+
+def test_the_car_ahead_pulling_away_is_an_event_and_you_leaving_completes_it():
+  stop = [(i, car(0, {"d": 6, "v": 0})) for i in range(5)]
+  r = run_drive([(-2, car(40)), (-1, car(20)), *stop, (5, car(0, {"d": 7, "v": 8})), (6, car(0, {"d": 10, "v": 12})), (7, car(0, {"d": 12, "v": 13})),
+                 (8, car(5, {"d": 14, "v": 15}))])  # a reading a second, as the page reads
+  kinds = [e["kind"] for e in r["evs"]]
+  assert kinds == ["stop_lead", "pull_away"]  # the stop behind it, then the car ahead leaving: once
+  pull = r["evs"][1]
+  assert pull["t"] == 5000 and pull["data"]["d"] == 6
+  assert r["ups"] == [{"id": pull["id"], "data": {"go_s": 3.0}}]  # you left 3 s after it
+
+
+def test_a_lead_that_does_not_move_is_no_event_and_a_short_stop_does_not_arm():
+  r = run_drive([(-1, car(30)), *[(i, car(0, {"d": 6, "v": 0})) for i in range(30)]])
+  assert [e["kind"] for e in r["evs"]] == ["stop_lead"]
+  r = run_drive([(0, car(0, {"d": 6, "v": 0})), (1, car(0, {"d": 9, "v": 6}))])  # 1 s behind it: not armed yet
+  assert r["evs"] == []
+
+
+def test_the_car_ahead_braking_needs_its_deceleration_close_and_a_real_drop():  # route 32 (CTO review of app-11)
+  follow = [(i, car(50, {"d": 30, "v": 50, "a": 0.})) for i in range(3)]
+  r = run_drive([*follow, (3, car(50, {"d": 28, "v": 45, "a": -0.6})), (4, car(48, {"d": 25, "v": 40, "a": -0.9}))])
+  assert [e["kind"] for e in r["evs"]] == ["lead_brake"]
+  assert r["evs"][0]["data"]["from"] == 50 and r["evs"][0]["data"]["to"] == 40
+  # what fired on route 32: the speed of a car 35–60 m ahead swinging, with no deceleration behind it
+  swing = [(3, car(50, {"d": 30, "v": 38, "a": 0.})), (4, car(50, {"d": 30, "v": 52, "a": -0.1})), (5, car(50, {"d": 30, "v": 40, "a": 0.}))]
+  noise = run_drive([*follow, *swing])
+  assert noise["evs"] == []
+  far = run_drive([(i, car(70, {"d": 55, "v": 70 - 6 * i, "a": -1.})) for i in range(5)])  # beyond 40 m: too noisy to tell
+  assert far["evs"] == []
+  other = run_drive([*follow, (3, car(50, {"d": 15, "v": 38, "a": -0.6})), (4, car(50, {"d": 13, "v": 37, "a": -0.6}))])  # another car:
+  assert [e["kind"] for e in other["evs"]] == ["cut_in"]  # it cut in; its speed isn't the first one's braking
+  old = run_drive([*follow, (3, car(50, {"d": 28, "v": 44})), (4, car(48, {"d": 25, "v": 38}))])  # a comma that doesn't send a
+  assert old["evs"] == []
+  slow = run_drive([(i, car(50, {"d": 30, "v": 50 - 2 * i, "a": -0.6})) for i in range(10)])  # 2 km/h a second: not braking hard
+  assert slow["evs"] == []
+  crawl = run_drive([(0, car(15, {"d": 10, "v": 30, "a": -2.})), (1, car(15, {"d": 9, "v": 10, "a": -2.}))])  # you below 20 km/h
+  assert crawl["evs"] == []
+
+
+def test_a_cut_in_and_not_your_own_lane_change():
+  r = run_drive([(0, car(60)), (1, car(60)), (2, car(60, {"d": 18, "v": 55})), (3, car(60, {"d": 17, "v": 55}))])
+  assert [e["kind"] for e in r["evs"]] == ["cut_in"]
+  assert r["evs"][0]["t"] == 2000  # it counts from when it showed up, once the next reading saw it too
+  closer = run_drive([(0, car(60, {"d": 45, "v": 60})), (1, car(60, {"d": 20, "v": 55})), (2, car(60, {"d": 19, "v": 55}))])
+  assert [e["kind"] for e in closer["evs"]] == ["cut_in"]
+  # CTO review of app-11: closing in on a slower or stopped car is no cut-in, nor is a reading that flickers closer
+  approach = run_drive([(0, car(50, {"d": 45, "v": 0})), (1, car(50, {"d": 31, "v": 0})), (2, car(50, {"d": 17, "v": 0}))])
+  assert approach["evs"] == []
+  flicker = run_drive([(0, car(50, {"d": 19, "v": 48})), (1, car(50, {"d": 8, "v": 48})), (2, car(50, {"d": 20, "v": 48}))])
+  assert flicker["evs"] == []
+  mine = run_drive([(0, car(60, blinker="esquerda")), (2, car(60)), (3, car(60, {"d": 18, "v": 55}))])  # you changed lanes
+  assert mine["evs"] == []
+  far = run_drive([(0, car(60)), (1, car(60, {"d": 60, "v": 50}))])  # catching up with a far car
+  assert far["evs"] == []
+  blink = run_drive([(0, car(60, {"d": 20, "v": 58})), (1, car(60)), (2, car(60, {"d": 19, "v": 58}))])  # the same car, lost for a reading
+  assert blink["evs"] == []
+  first = run_drive([(0, car(60, {"d": 18, "v": 55}))])  # the first reading of the page: nothing before it to compare
+  assert first["evs"] == []
+
+
+def test_stops_long_stops_and_disengaging():
+  r = run_drive([(0, car(40)), (1, car(0)), *[(1 + i, car(0)) for i in range(1, 62)], (63, car(5))])
+  assert [e["kind"] for e in r["evs"]] == ["stop_free", "stop_long", "go_free"]
+  r = run_drive([(0, car(50)), (1, car(50, steering=False, brake=True))])
+  assert [(e["kind"], e["data"]["by"]) for e in r["evs"]] == [("disengage", "freio")]
+  assert run_drive([(0, car(3)), (1, car(3, steering=False))])["evs"] == []  # parking speed: not this
+  # always-on steering: the brake pauses the speed control, the steering stays, `enabled` stays: nothing let go (route 32)
+  assert run_drive([(0, car(50)), (1, car(50, brake=True))])["evs"] == []
+  # the car off resets everything: a stop after it is not an arrival
+  assert run_drive([(0, car(40)), (1, {"driving": False}), (2, car(0))])["evs"] == []
+
+
+def test_after_a_gap_nothing_fires_late_as_now():  # CTO review of app-11: page hidden, Wi-Fi gone
+  assert run_drive([(0, car(40)), (150, car(0))])["evs"] == []  # it stopped some time in those 150 s: not an arrival now
+  assert run_drive([(0, car(50)), (150, car(50, steering=False, gas=True))])["evs"] == []
+  assert [e["kind"] for e in run_drive([(0, car(40)), (2, car(40)), (4, car(0))])["evs"]] == ["stop_free"]  # 2 s apart: as always
+
+
+def test_the_car_ahead_leaving_with_you_creeping_or_in_the_same_reading():  # CTO review of app-11
+  stop = [(-1, car(40)), *[(i, car(0, {"d": 6, "v": 0})) for i in range(5)]]
+  r = run_drive([*stop, (5, car(5, {"d": 10, "v": 12}))])  # you and it in the same reading
+  assert [(e["kind"], e["data"].get("go_s")) for e in r["evs"]] == [("stop_lead", None), ("pull_away", 0)]
+  r = run_drive([*stop, (5, car(2, {"d": 7, "v": 8})), (8, car(5, {"d": 14, "v": 15}))])  # creeping at 2 km/h is still stopped
+  assert [e["kind"] for e in r["evs"]] == ["stop_lead", "pull_away"] and r["ups"][0]["data"] == {"go_s": 3.0}
+  r = run_drive([*stop, (5, car(0)), (6, car(0, {"d": 6, "v": 0}))])  # it vanished for one reading: still there
+  assert [e["kind"] for e in r["evs"]] == ["stop_lead"]
+
+
+def test_a_stale_reading_is_not_fed():
+  html = (LOGIC.parent / "index.html").read_text()
+  feed = html[html.index("function renderDrive()"):]
+  feed = feed[:feed.index("renderCop();")]
+  assert "if (!b.stale) { const r = LPL.eventStep(" in feed  # old data neither fires nor resets an event
+
+
+def test_a_point_seen_close_ahead_then_behind_was_passed():
+  p = {"key": "k1", "kind": "radar", "limit": 60, "ahead": True, "distance": 120, "confirmed": False, "mine": False}
+  script = f"""const L = require({json.dumps(str(LOGIC))}); const P = {json.dumps(p)};
+  let a = L.pointPassed(null, [P], 0); a = L.pointPassed(a.st, [{{ ...P, distance: 45 }}], 4000);
+  const b = L.pointPassed(a.st, [{{ ...P, ahead: false, distance: 40 }}], 9000);
+  const far = L.pointPassed(null, [{{ ...P, distance: 2000 }}], 0);
+  const c = L.pointPassed(far.st, [{{ ...P, ahead: false }}], 9000);
+  const away = L.pointPassed(L.pointPassed(null, [{{ ...P, distance: 250 }}], 0).st, [{{ ...P, ahead: false, distance: 255 }}], 9000);
+  const still = L.pointPassed(a.st, [{{ ...P, ahead: false, distance: 40 }}], 9000, false);
+  process.stdout.write(JSON.stringify([a.events, b.events, c.events, away.events, still.events]));"""
+  a, b, c, away, still = json.loads(subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout)
+  assert a == [] and c == []  # seen only far away: nothing to ask
+  assert away == [] and still == []  # never closer than 250 m (another street), or the car not moving (the heading wanders)
+  assert len(b) == 1 and b[0]["kind"] == "radar"
+  assert b[0]["data"] == {"key": "k1", "kind": "radar", "limit": 60, "side": None, "confirmed": False, "mine": False}
+
+
+def test_the_big_card_is_the_newest_recent_event_and_ages_go_by_stage():
+  evs = [{"id": "a", "kind": "stop_lead", "t": 0}, {"id": "b", "kind": "lead_brake", "t": 100_000},
+         {"id": "c", "kind": "cut_in", "t": 110_000, "answer": {"r": "ok"}}]
+  v = run("copilotView", evs, 120_000, None, 0)
+  assert v["main"]["id"] == "b" and v["stage"] == "live" and not v["review"]  # c is answered: never back on screen
+  assert [(e["id"], e["stage"]) for e in v["pending"]] == [("a", "past")]  # 2 min old: grey, in the list
+  later = run("copilotView", evs, 300_000, None, 0)
+  assert later["main"] is None and [e["stage"] for e in later["pending"]] == ["past", "past"]  # waiting: nothing to skip
+  picked = run("copilotView", evs, 300_000, "a", 290_000)
+  assert picked["main"]["id"] == "a" and picked["stage"] == "past" and picked["review"]
+  newer = run("copilotView", evs + [{"id": "d", "kind": "pull_away", "t": 295_000}], 300_000, "a", 290_000)
+  assert newer["main"]["id"] == "d"  # a newer event takes the card back from the review
+  assert run("eventClock", {"t": 0}, 64_000) == {"short": True, "m": 1, "s": 4}
+
+
+def test_an_event_answers_an_open_mission_first_on_the_drive():
+  cat = {"missions": [{"key": "sair-sozinho"}, {"key": "fila"}, {"key": "frear-antes", "lock": "x"}]}
+  ev = {"kind": "pull_away"}
+  assert run("eventMission", ev, cat, ["fila"], {}) == "fila"
+  assert run("eventMission", ev, cat, [], {}) is None  # not taken on this drive: its option may be off (CTO review of app-11)
+  assert run("eventMission", ev, cat, ["sair-sozinho"], {}) == "sair-sozinho"
+  assert run("eventMission", ev, cat, [], {"sair-sozinho": {"full": True}, "fila": {"full": True}}) is None
+  assert run("eventMission", {"kind": "lead_brake"}, cat, [], {}) is None  # locked: not this one
+  assert run("eventMission", {"kind": "cut_in"}, cat, [], {}) is None
+
+
+def test_the_log_keeps_the_newest_and_merges_updates():
+  evs = [{"id": str(i), "kind": "cut_in", "t": i, **({"answer": {"r": "ok"}} if i % 2 else {})} for i in range(40)]
+  out = run("eventsMerge", evs, [{"id": "new", "kind": "stop_long", "t": 99}], [{"id": "0", "data": {"go_s": 2}}])
+  assert len(out) == 40 and out[-1]["id"] == "new" and out[0]["data"]["go_s"] == 2
+  assert "1" not in [e["id"] for e in out]  # the oldest answered one went first
+
+
+def test_every_event_kind_has_its_texts_and_the_card_keeps_one_height():
+  html = (LOGIC.parent / "index.html").read_text()
+  kinds = ["lead_brake", "pull_away", "stop_lead", "stop_free", "go_free", "stop_long", "cut_in", "disengage", "bump", "radar"]
+  table = html[html.index("const EVENT_UI = {"):html.index("const STAGE_TEXT")]
+  assert all(f"  {k}: {{ title:" in table for k in kinds)
+  css = html[html.index(".evcard {"):]
+  assert css.index("height: 392px") < css.index("}")  # fixed: the answers stay where the finger is, whatever happened
+  assert "evbtns" in html and "evthird" in html
+  # the clock ticks in place: the card is built again only when what it says changes (a tap is never lost to a rebuild)
+  render = html[html.index("function renderCop()"):html.index("function renderDriveMissions(")]
+  assert "main.dataset.sig !== msig" in render and "evClock(main.firstChild" in render
+  # an answer only opens the note: Salvar is what saves
+  tap = html[html.index("function evTap("):html.index("function openEv(")]
+  assert "api(" not in tap
+
+
+def test_events_from_the_drives_log_join_the_phones_once():
+  # timeline.py "cop": seconds from the drive's start, the start being its end minus how long it ran (owner, 03/11)
+  trip = {"id": "0000000f--8784034901", "mtime": 10_000, "minutes": 12, "hidden": False,
+          "summary": {"s": 700, "cop": [{"s": 63.1, "kind": "pull_away", "v": 0, "data": {"d": 7, "go_s": 4.0}},
+                                        {"s": 200.0, "kind": "stop_lead", "v": 0, "data": {"d": 2}}]}}
+  phone = [{"id": "p1", "kind": "stop_lead", "t": (10_000 - 700 + 210) * 1000, "answer": {"r": "ok"}}]  # the phone saw it, 10 s off
+  out = run("logEvents", [trip], phone, 0)
+  assert [(e["kind"], e["src"], e["t"]) for e in out] == [("pull_away", "log", round((10_000 - 700 + 63.1) * 1000))]
+  assert out[0]["id"] == "0000000f--8784034901-63.1-pull_away" and out[0]["data"] == {"d": 7, "go_s": 4.0}
+  assert run("logEvents", [trip], phone + out, 0) == []  # once
+  assert run("logEvents", [{**trip, "hidden": True}], [], 0) == [] and run("logEvents", [trip], [], 10_000_000) == []  # hidden, older
+
+
+def test_the_review_asks_about_letting_go_only_without_your_pedal():
+  html = (LOGIC.parent / "index.html").read_text()
+  rel = html[html.index("function evRelevant(e)"):]
+  rel = rel[:rel.index("\n}\n")]
+  assert '["freio", "acelerador"].includes' in rel and "evMission(e)" in rel
+
+
+def test_the_drives_clock_starts_where_its_last_minute_ended():
+  # CTO review of app-12: "s" is the time driven, so a minute missing in the middle moved every event of the drive
+  trip = {"id": "r", "mtime": 10_000, "minutes": 11, "hidden": False,
+          "summary": {"s": 600, "end_s": 720, "cop": [{"s": 100.0, "kind": "stop_lead", "v": 0, "data": {}}]}}
+  assert run("logEvents", [trip], [], 0)[0]["t"] == (10_000 - 720 + 100) * 1000
+
+
+def _drive(rid, end_ms, n):
+  cop = [{"s": float(60 * (i + 1)), "kind": ("stop_lead", "pull_away", "cut_in", "lead_brake")[i % 4], "v": 30, "data": {}} for i in range(n)]
+  return {"id": rid, "mtime": end_ms / 1000, "minutes": n + 2, "hidden": False, "summary": {"s": 60 * (n + 2), "end_s": 60 * (n + 2), "cop": cop}}
+
+
+def test_the_review_keeps_its_answers_with_more_events_than_the_phone_keeps():
+  # CTO review of app-12: the log's events merged into the phone's list (EV_KEEP 40) swapped one drive for the other on
+  # every render, and the answers went with them. The list is built on the fly, the answers kept apart
+  now, H = 1_800_000_000_000, 3_600_000
+  trips = [_drive("r2", now - H, 40), _drive("r1", now - 20 * H, 40)]
+  since = now - 48 * H
+  first = run("reviewList", [], trips, {}, since)
+  assert len(first) == 80 and len({e["id"] for e in first}) == 80
+  answers = {}
+  for e in first[-3:]:
+    answers = run("answerKeep", answers, e, "ok", now, since)
+  again = run("reviewList", [], trips, answers, since)
+  assert len(again) == 77 and not any(e["id"] in answers for e in again)  # answered: never back as pending
+  assert run("reviewList", [], trips, answers, since) == again  # the same list on every render
+
+
+def test_a_log_copy_of_an_event_answered_on_the_phone_and_dropped_there_never_comes_back():
+  now = 1_800_000_000_000
+  trip = _drive("r", now, 2)
+  t0 = now - trip["summary"]["end_s"] * 1000
+  phone = {"id": "p1", "kind": "stop_lead", "t": t0 + 65_000, "v": 0, "data": {}}  # the log's first, 5 s off
+  answers = run("answerKeep", {}, phone, "ok", now, 0)
+  out = run("reviewList", [], [trip], answers, 0)  # the phone's list no longer has it (EV_KEEP_H, EV_KEEP)
+  assert [e["kind"] for e in out] == ["pull_away"]
+  live = run("reviewList", [{**phone, "answer": None}], [trip], answers, 0)  # still on the phone: it shows answered
+  assert live[0]["id"] == "p1" and live[0]["answer"]["r"] == "ok"
+
+
+def test_the_answers_kept_apart_stay_bounded():
+  answers = run("answerKeep", {}, {"id": "old", "kind": "stop_lead", "t": 1_000}, "ok", 5, 0)
+  answers = run("answerKeep", answers, {"id": "new", "kind": "stop_lead", "t": 1_449}, "ok", 5, 1_100)
+  assert set(answers) == {"new"}  # older than the window: out
+  big = {f"e{i}": {"id": f"e{i}", "kind": "x", "t": i, "r": "ok", "at": 0} for i in range(500)}
+  kept = run("answerKeep", big, {"id": "new", "kind": "x", "t": 1_000}, "ok", 0, 0)
+  assert len(kept) == 400 and "new" in kept and "e0" not in kept
+
+
+def test_the_review_lists_never_store_the_logs_events_with_the_phones():
+  html = (LOGIC.parent / "index.html").read_text()
+  assert "evAddLog" not in html and "LPL.reviewList(evList, trips, evAnswers" in html
+  done = html[html.index("function evDone(id, r)"):]
+  done = done[:done.index("\n}\n")]
+  assert "LPL.answerKeep(" in done and "ansSave()" in done
+  assert '"lpCopAnswers"' in LOGIC.read_text() and 'EV_ANS_STORE = "lpCopAnswers"' in html
+
+
+def test_the_review_keeps_the_event_you_picked_with_the_car_off():
+  html = (LOGIC.parent / "index.html").read_text()
+  render = html[html.index("function render(s, copy, ep)"):]
+  render = render[:render.index("\n}\n")]
+  assert "if (!copReview) evPick = null;" in render and "passSt = null; evPick = null;" not in render
+
+
+def test_two_close_events_of_the_log_stay_two_and_a_phone_event_takes_one():
+  # CTO review of app-12: the log's events went into the comparison list as they were added, so two cut-ins 12 s apart (the
+  # detector's cooldown is 10 s) became one; a phone event stands for one of the log's, the nearest
+  trip = {"id": "r", "mtime": 10_000, "minutes": 5, "hidden": False,
+          "summary": {"t0": 9_700, "cop": [{"s": 100.0, "kind": "cut_in", "v": 40, "data": {"d": 9}},
+                                           {"s": 112.0, "kind": "cut_in", "v": 40, "data": {"d": 11}}]}}
+  assert [e["t"] for e in run("logEvents", [trip], [], 0)] == [9_800_000, 9_812_000]
+  phone = [{"id": "p", "kind": "cut_in", "t": 9_813_000}]
+  assert [e["t"] for e in run("logEvents", [trip], phone, 0)] == [9_800_000]
+
+
+def test_the_drives_start_is_the_commas_clock_first():
+  assert run("driveStart", {"mtime": 10_000, "minutes": 5, "summary": {"t0": 9_650.5, "end_s": 300, "s": 290}}) == 9_650.5
+  assert run("driveStart", {"mtime": 10_000, "minutes": 5, "summary": {"end_s": 300, "s": 290}}) == 9_700
+  assert run("driveStart", {"mtime": 10_000, "minutes": 5, "summary": {}}) == 9_700
+
+
+def test_the_review_answers_and_fiz_agora_keep_their_moment():
+  html = (LOGIC.parent / "index.html").read_text()
+  render = html[html.index("function render(s, copy, ep)"):]
+  render = render[:render.index("\n}\n")]
+  assert "if (evAns && carNow().moving && !passengerOk) closeEv();" in render  # a note never rides along unconfirmed
+  save = html[html.index("async function saveEv()"):]
+  save = save[:save.index("\n}\n")]
+  assert "Date.now() - a.tapped" in save and "!carOn ? { at: Math.round(ev.t / 100) / 10 }" in save
+  assert html.count("openEv(null, \"done\", EV_BUTTONS.done, m.key, at)") == 2
+  cop = html[html.index("function renderCop()"):]
+  assert '$("copTitle").textContent = t(copReview ? "A conferir" : "Copiloto")' in cop[:cop.index("\n}\n")]

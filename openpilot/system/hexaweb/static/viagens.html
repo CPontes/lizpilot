@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0B0E11">
+<link rel="stylesheet" href="/lp.css">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="LizPilot">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" href="/favicon.png">
+<title>Viagens</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.45 var(--font); }
+  main { max-width: 640px; margin: 0 auto; padding: 16px 16px 48px; }
+  h1 { font-size: 32px; margin: 4px 0 2px; }
+  a { color: inherit; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 14px 16px; margin-bottom: 12px; }
+  select { width: 100%; font: inherit; padding: 12px; border-radius: 10px; border: 1px solid var(--line);
+           background: var(--bg); color: var(--text); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat b { display: block; font-family: var(--font-display); font-size: 24px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  canvas { display: block; width: 100%; height: 340px; border-radius: 10px; background: var(--bg); touch-action: none; }
+  input[type=range] { width: 100%; margin: 12px 0 4px; }
+  .where { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .legend i { display: inline-block; width: 18px; height: 4px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+  .legend i.ponto { width: 10px; height: 10px; border-radius: 50%; }
+  .warn { color: var(--warn); font-size: 14px; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: 12px 0; min-height: 44px; border-top: 1px solid var(--line); font-size: 15px; cursor: pointer; display: flex; gap: 12px; }
+  li:first-child { border-top: 0; }
+  li .time { color: var(--muted); min-width: 52px; font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 12px 16px; cursor: pointer;
+           background: var(--accent); color: var(--on-accent); width: 100%; margin-top: 10px; min-height: 52px; font-family: var(--font-display); font-size: 19px; }
+  .hidden { display: none; }
+  .hidebox { text-align: center; }
+  button.ghost { background: none; color: var(--warn); border: 1px solid var(--warn-line); font-family: var(--font); font-size: 17px; margin-top: 0; }
+  .hidebox .sub { margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <p class="sub" style="margin:0 0 8px"><a href="/" class="back"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>LizPilot</a></p>
+  <h1 data-t>Viagens</h1>
+  <p class="sub" id="msg" data-t>Carregando…</p>
+  <div id="view" class="hidden">
+    <div class="card"><select id="trip" data-t-aria="Viagem" aria-label="Viagem"></select></div>
+    <div class="card stats">
+      <div class="stat"><b id="sKm">—</b><span data-t>km</span></div>
+      <div class="stat"><b id="sMin">—</b><span data-t>minutos</span></div>
+      <div class="stat"><b id="sOn">—</b><span data-t>openpilot dirigindo, com o carro andando</span></div>
+      <div class="stat"><b id="sDriver">—</b><span data-t>você no volante</span></div>
+      <div class="stat"><b id="sGas">—</b><span data-t>você no acelerador</span></div>
+      <div class="stat"><b id="sBrake">—</b><span data-t>você no freio</span></div>
+      <div class="stat"><b id="sOff">—</b><span data-t>desengates</span></div>
+      <div class="stat"><b id="sMarks">—</b><span data-t>marcas</span></div>
+    </div>
+    <div class="card">
+      <canvas id="map" role="img" data-t-aria="Caminho da viagem" aria-label="Caminho da viagem"></canvas>
+      <input id="pos" type="range" min="0" max="0" value="0" data-t-aria="Percorrer o caminho" aria-label="Percorrer o caminho">
+      <div class="where"><span id="whereT">—</span><span id="whereV"></span></div>
+      <div class="warn hidden" id="noGps" data-t>Sem GPS nesta viagem: caminho aproximado, feito pelas rodas e pelo volante.</div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i><b data-t style="font-weight:400">openpilot</b></span>
+        <span><i style="background:var(--off)"></i><b data-t style="font-weight:400">você</b></span>
+        <span><i style="background:var(--wheel)"></i><b data-t style="font-weight:400">volante</b></span>
+        <span><i style="background:var(--gas)"></i><b data-t style="font-weight:400">acelerador</b></span>
+        <span><i style="background:var(--danger)"></i><b data-t style="font-weight:400">freio</b></span>
+        <span><i class="ponto" style="background:var(--mark)"></i><b data-t style="font-weight:400">marca</b></span>
+        <span><i class="ponto" style="background:var(--danger)"></i><b data-t style="font-weight:400">desengate</b></span>
+      </div>
+      <button id="openReplay" data-t>Ver este momento no replay</button>
+    </div>
+    <div class="card"><ul id="events"></ul></div>
+    <div class="card hidebox">
+      <button id="hideTrip" class="ghost" data-t>Ocultar esta viagem</button>
+      <p class="sub" id="hideNote" data-t>Sai das listas do celular. O log continua no comma: dá para mostrar de novo no Início.</p>
+    </div>
+  </div>
+</main>
+<script src="/i18n.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const T = (x) => LP.t(x), TF = (x, v) => LP.tf(x, v);
+let token = null;
+try { token = localStorage.getItem("hexaToken"); } catch (e) {}
+let points = [], events = [], drawn = [], loading = 0;
+const meta = {};  // route → the drive from the list, with the summary the comma already made
+const CODE_WHO = ["op", "wheel", "pedal", "you"];  // the path kept for the map (hexaweb.trip_path): who drove, as a number
+
+async function get(path) {
+  const r = await fetch(path, { headers: token ? { Authorization: "Bearer " + token } : {} });
+  let body = {};
+  try { body = await r.json(); } catch (e) {}
+  return { status: r.status, body };
+}
+
+function fmt(s) { return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; }
+function color(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+const WHO = { op: ["--accent", "openpilot dirigindo"], you: ["--off", "você dirigindo"], wheel: ["--wheel", "você no volante"],
+              gas: ["--gas", "você no acelerador"], brake: ["--danger", "você no freio"], pedal: ["--gas", T("você nos pedais")] };  // T(): so the catalogs find it
+function who(p) { return WHO[p.who] || WHO[p.on ? "op" : "you"]; }
+const SHOWN = ["mark", "off", "hardbrake"];
+
+async function loadTrips() {
+  const r = await get("/api/trips");
+  if (r.status === 401) { $("msg").textContent = T("Pareie este celular no painel primeiro."); return; }
+  if (r.status !== 200) { $("msg").textContent = T(r.body.error || "Não foi possível listar as viagens."); return; }
+  if (!r.body.trips.length) { $("msg").textContent = T("Nenhuma viagem gravada."); return; }
+  const sel = $("trip"); sel.replaceChildren();
+  const wanted = new URLSearchParams(location.search).get("trip");  // opened from a trip card on the panel
+  for (const t of r.body.trips) {
+    if (t.hidden && t.id !== wanted) continue;  // hidden on the phone: only when asked for by name
+    meta[t.id] = t;
+    const o = document.createElement("option"); o.value = t.id; o.dataset.hidden = t.hidden ? "1" : "";
+    o.dataset.segments = JSON.stringify(t.segments);
+    o.textContent = `${new Date(t.mtime * 1000).toLocaleString(LP.locale, { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })} · ${t.minutes} min`;
+    sel.append(o);
+  }
+  if (!sel.options.length) { $("msg").textContent = T("Todas as viagens estão ocultas. Elas aparecem no Início, em “mostrar”."); return; }
+  if (wanted && [...sel.options].some((o) => o.value === wanted)) sel.value = wanted;
+  $("view").classList.remove("hidden");
+  hideLabel();
+  loadTrip();
+}
+
+function hideLabel() {
+  const hidden = !!$("trip").selectedOptions[0].dataset.hidden;
+  $("hideTrip").textContent = T(hidden ? "Mostrar de novo nas listas" : "Ocultar esta viagem");
+  $("hideNote").textContent = T(hidden ? "Esta viagem está oculta no celular." : "Sai das listas do celular. O log continua no comma: dá para mostrar de novo no Início.");
+}
+$("hideTrip").addEventListener("click", async () => {
+  const o = $("trip").selectedOptions[0], hidden = !o.dataset.hidden;
+  const r = await fetch("/api/trip/hide", { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) },
+                                            body: JSON.stringify({ route: o.value, hidden }) }).catch(() => null);
+  if (!r || r.status !== 200) { $("msg").textContent = T("Não deu para ocultar a viagem."); return; }
+  if (hidden) { location.href = "/"; return; }  // back to the list, without it
+  o.dataset.hidden = ""; hideLabel();
+});
+
+async function loadTrip() {
+  const load = ++loading;
+  const sel = $("trip"), route = sel.value;
+  const segments = JSON.parse(sel.selectedOptions[0].dataset.segments);
+  points = []; events = []; render();
+  let sum = { km: 0, s: 0, moving_s: 0, on_s: 0, driver: 0, gas: 0, brake: 0, off: 0, marks: 0 };
+  // At once: the numbers and the path the comma kept when the drive ended. The minutes, read one by one, replace them at the end.
+  const known = meta[route] && meta[route].summary;
+  if (known) summary(Object.fromEntries(Object.keys(sum).map((k) => [k, known[k] || 0])));
+  let preview = false;
+  const pr = await get(`/api/trip/path?route=${encodeURIComponent(route)}`);
+  if (load !== loading) return;
+  if (pr.status === 200 && pr.body.points.length > 1) {
+    points = pr.body.points.map(([lat, lon, w, s]) => ({ lat, lon, who: CODE_WHO[w], on: w < 3, v: null, t: s,  // s from minute 0
+                                                         n: Math.floor(s / 60), step: 0, dpsi: 0 }));
+    preview = true; render();
+  }
+  const got = [], evs = [];
+  for (const [i, n] of segments.entries()) {
+    $("msg").textContent = TF("Lendo minuto {i} de {n}…", { i: i + 1, n: segments.length });
+    const r = await get(`/api/trip/segment?route=${encodeURIComponent(route)}&n=${n}`);
+    if (load !== loading) return;  // another trip was picked
+    if (r.status !== 200) { $("msg").textContent = T(r.body.error || "Não foi possível ler a viagem."); return; }
+    const d = r.body, offset = n * 60;
+    for (const p of d.points) got.push({ ...p, t: p.t + offset, n });
+    for (const e of d.events) evs.push({ ...e, t: e.t + offset, n });
+    for (const k of Object.keys(sum)) sum[k] += d.summary[k] || 0;
+    if (!preview) { points = got; events = evs; summary(sum); render(); }  // nothing kept yet: draw as it reads
+  }
+  if (got.length > 1) { points = got; events = evs; listed = -1; summary(sum); render(); }
+  $("msg").textContent = T("Arraste a barra para percorrer o caminho.");
+}
+
+function summary(s) {
+  $("sKm").textContent = s.km.toFixed(1);
+  $("sMin").textContent = Math.round(s.s / 60);
+  $("sOn").textContent = s.moving_s ? Math.round(100 * s.on_s / s.moving_s) + "%" : "—";
+  $("sDriver").textContent = s.driver;
+  $("sGas").textContent = s.gas;
+  $("sBrake").textContent = s.brake;
+  $("sOff").textContent = s.off;
+  $("sMarks").textContent = s.marks;
+}
+
+function layout() {
+  // GPS when most of the trip has it; otherwise the path from the wheels and the steering
+  const fixes = points.filter(p => p.lat !== null);
+  const useGps = fixes.length > 0.6 * points.length;
+  $("noGps").classList.toggle("hidden", useGps || !points.length);
+  let xy;
+  if (useGps) {
+    const k = Math.cos(fixes[0].lat * Math.PI / 180);
+    let last = fixes[0];
+    xy = points.map(p => { if (p.lat !== null) last = p; return [last.lon * k * 111320, last.lat * 111320]; });
+  } else {
+    let x = 0, y = 0, psi = Math.PI / 2;
+    xy = points.map(p => { psi += p.dpsi; x += p.step * Math.cos(psi); y += p.step * Math.sin(psi); return [x, y]; });
+  }
+  const c = $("map"), w = c.clientWidth, h = c.clientHeight, pad = 18;
+  const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
+  const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+  const scale = Math.min((w - 2 * pad) / Math.max(x1 - x0, 1), (h - 2 * pad) / Math.max(y1 - y0, 1));
+  const ox = (w - (x1 - x0) * scale) / 2, oy = (h - (y1 - y0) * scale) / 2;
+  return xy.map(([x, y]) => [ox + (x - x0) * scale, h - oy - (y - y0) * scale]);
+}
+
+function nearest(t) {
+  let best = 0;
+  for (let i = 0; i < points.length; i++) if (Math.abs(points[i].t - t) < Math.abs(points[best].t - t)) best = i;
+  return best;
+}
+
+function render() {
+  const c = $("map"), ratio = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * ratio; c.height = c.clientHeight * ratio;
+  const g = c.getContext("2d");
+  g.scale(ratio, ratio);
+  g.clearRect(0, 0, c.clientWidth, c.clientHeight);
+  $("pos").max = Math.max(points.length - 1, 0);
+  if (points.length < 2) return;
+  drawn = layout();
+  g.lineWidth = 4; g.lineCap = "round";
+  for (let i = 1; i < drawn.length; i++) {
+    g.strokeStyle = color(who(points[i])[0]);
+    g.beginPath(); g.moveTo(...drawn[i - 1]); g.lineTo(...drawn[i]); g.stroke();
+  }
+  for (const e of events) {
+    if (!SHOWN.includes(e.kind)) continue;
+    const [x, y] = drawn[nearest(e.t)];
+    g.fillStyle = e.kind === "mark" ? color("--mark") : color("--danger");
+    g.beginPath(); g.arc(x, y, 5, 0, 7); g.fill();
+  }
+  const i = Math.min($("pos").value * 1, points.length - 1), p = points[i];
+  g.fillStyle = color("--text");
+  g.beginPath(); g.arc(...drawn[i], 7, 0, 7); g.fill();
+  $("whereT").textContent = fmt(p.t);
+  $("whereV").textContent = `${p.v == null ? "—" : Math.round(p.v)} km/h · ${T(who(p)[1])}`;
+  list();
+}
+
+let listed = -1;
+function list() {
+  if (listed === events.length) return;
+  listed = events.length;
+  const ul = $("events"); ul.replaceChildren();
+  for (const e of [...events].sort((a, b) => a.t - b.t)) {
+    if (!SHOWN.includes(e.kind)) continue;
+    const li = document.createElement("li");
+    const tm = document.createElement("span"); tm.className = "time"; tm.textContent = fmt(e.t);
+    const tx = document.createElement("span"); tx.textContent = T(e.text);
+    li.append(tm, tx);
+    li.addEventListener("click", () => { $("pos").value = nearest(e.t); render(); window.scrollTo({ top: 0, behavior: "smooth" }); });
+    ul.append(li);
+  }
+  if (!ul.children.length) { const li = document.createElement("li"); li.textContent = T("Sem marcas nem desengates."); ul.append(li); }
+}
+
+$("pos").addEventListener("input", render);
+$("map").addEventListener("pointerdown", (ev) => {
+  if (!drawn.length) return;
+  const r = $("map").getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+  let best = 0, dist = Infinity;
+  drawn.forEach(([a, b], i) => { const d = (a - x) ** 2 + (b - y) ** 2; if (d < dist) { dist = d; best = i; } });
+  $("pos").value = best; render();
+});
+$("trip").addEventListener("change", () => { listed = -1; $("pos").value = 0; hideLabel(); loadTrip(); });
+$("openReplay").addEventListener("click", () => {
+  const p = points[$("pos").value * 1];
+  if (p) location.href = `/replay?id=${encodeURIComponent($("trip").value + "--" + p.n)}&t=${Math.max(0, p.t - p.n * 60 - 2)}`;
+});
+window.addEventListener("resize", render);
+LP.ready.then(() => { LP.apply(); loadTrips(); });
+</script>
+</body>
+</html>
