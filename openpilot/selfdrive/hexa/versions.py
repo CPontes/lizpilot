@@ -20,7 +20,18 @@ class Release:
 
 
 RELEASES: tuple[Release, ...] = (
-  Release("", "05/11", "8066720", "Missões que avançam na hora",
+  Release("", "05/11", "8066720", "Erros direto para análise e a tela que não rola atrás",
+          ("«Enviar para análise» mostra o que vai e manda direto aos desenvolvedores, com o código do envio; sem dados do carro, do comma ou de onde",
+           "Os erros que são normais ficam em «ver todos», e a data errada vira «antes de o relógio acertar»",
+           "O Copiloto e as caixas não deixam mais a página de trás rolar; o título do Copiloto fica fixo",
+           "Coleta para a comma: cada missão com o passo a passo, e cinco novas"),
+          driving=False),
+  Release("9e705cb", "05/11", "8066720", "Direção: o atraso não muda sozinho",
+          ("O atraso que o comma usa para guiar fica em 0,50 s, como hoje: nada muda ao dirigir",
+           "Antes, um trecho de estrada acima de 80 km/h faria o comma trocar sozinho para ~0,27 s, aprendido numa versão antiga",
+           "O comma continua medindo e gravando o atraso, para um teste planejado"),
+          driving=False),
+  Release("b241578", "05/11", "8066720", "Missões que avançam na hora",
           ("Missões: o que você faz conta na hora, como «feita · a conferir»; o nível e os selos já sobem",
            "Depois o CTO confere no log: aceita, ou devolve com o motivo e o celular pede para refazer",
            "«Instalar a versão nova» espera a versão que o comma roda; «200 km» conta numa mesma semana"),
