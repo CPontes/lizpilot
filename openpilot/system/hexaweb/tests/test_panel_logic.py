@@ -514,6 +514,62 @@ def test_missions_seen_in_the_summaries_and_the_owners_marks_count_at_once():
   assert not run("missionProgress", CAT, st, [trip(moving=1200, hour_end=21)])["noite"]["full"]
 
 
+def test_the_approval_checks_tick_from_the_drive_summary():  # MISS-01: the log does the Marcar's job too
+  ms = [_m("cinto", "parado", detect="belt"), _m("portas", "parado", 4, detect="doors"), _m("cambio", "parado", detect="gears"),
+        _m("pedais", "parado", 2, detect="pedals"), _m("piscas", "parado", 3, detect="blinkers"), _m("cego", "marca", 2, detect="bsm"),
+        _m("ligar", "parado", 3, detect="ign3")]
+  cat = {"levels": CAT["levels"], "trails": [], "missions": ms}
+  assert all(p["d"] == 0 for p in run("missionProgress", cat, {}, [trip()]).values())
+
+  def sig(end_min=0, **sg):
+    t = trip()
+    t["mtime"] += end_min * 60
+    t["summary"].update(sg)
+    return t
+  one = sig(sg_belt=1, sg_door=3, sg_gears=15, sg_brake=2, sg_left=1, sg_hazard=1, sg_bsm_r=1)
+  p = run("missionProgress", cat, {}, [one])
+  assert p["cinto"]["full"] and p["cambio"]["full"] and p["portas"]["d"] == 3 and p["pedais"]["d"] == 1
+  assert p["piscas"]["d"] == 2 and p["cego"]["d"] == 1 and p["cinto"]["checked"]  # the log is the proof: accepted at once
+  assert not run("missionProgress", cat, {}, [sig(sg_gears=13)])["cambio"]["full"]  # no reverse
+  # the doors in one stop; three starts within 15 minutes
+  assert run("missionProgress", cat, {}, [sig(sg_door=2), sig(1, sg_door=2)])["portas"]["d"] == 2
+  starts = [sig(0), sig(5), sig(10)]
+  assert run("missionProgress", cat, {}, starts)["ligar"]["full"]
+  assert run("missionProgress", cat, {}, [sig(0), sig(20), sig(40)])["ligar"]["d"] == 0  # one start is any drive
+  assert run("missionProgress", cat, {}, [sig(0), sig(5)])["ligar"]["d"] == 2
+  hidden = dict(one, hidden=True)
+  assert not run("missionProgress", cat, {}, [hidden])["cinto"]["full"]  # a hidden drive doesn't count
+
+
+def test_a_new_cars_approval_and_its_report():  # MISS-01 B, the generic edition
+  ms = [dict(_m("ap-cinto", "parado", detect="belt"), trail="ap-sinais"), dict(_m("ap-portas", "parado", 4, detect="doors"), trail="ap-sinais"),
+        dict(_m("ap-engatar", "auto", detect="engaged"), trail="ap-engate"), dict(_m("ap-freio-desliga", "auto", detect="brake_off"), trail="ap-engate"),
+        dict(_m("ap-cancelar", "marca"), trail="ap-engate"), dict(_m("ap-sem-falha", "auto", detect="lat30"), trail="ap-direcao"),
+        dict(_m("ap-freio-mao", "parado"), trail="ap-sinais"), dict(_m("outra", "parado"), trail="celular")]
+  cat = {"levels": CAT["levels"], "trails": [], "missions": ms}
+
+  def drive(**sg):
+    t = trip()
+    t["summary"].update(sg)
+    return t
+  trips = [drive(sg_belt=1, sg_door=2, on_s=2000, brake=1, sg_steer_fault=0)]
+  p = run("missionProgress", cat, {"answers": {"ap-freio-mao": 1}, "pending": [{"key": "ap-cancelar", "t": 1}]}, trips)
+  assert p["ap-engatar"]["full"] and p["ap-freio-desliga"]["full"] and p["ap-sem-falha"]["full"]
+  assert not run("missionProgress", cat, {}, [drive(on_s=2000, sg_steer_fault=1)])["ap-sem-falha"]["full"]  # a fault in it
+  assert not run("missionProgress", cat, {}, [drive(on_s=2000)])["ap-sem-falha"]["full"]  # an old summary, faults not counted
+  assert not run("missionProgress", cat, {}, [drive(on_s=30)])["ap-engatar"]["full"]  # half a minute
+  rep = run("approvalReport", cat, p, trips)
+  assert rep.startswith("# comma porting checklist") and "outra" not in rep and "Outra" not in rep
+  lines = rep.split("\n")
+  assert "- [x] Seatbelt: seen in the drive logs" in lines
+  assert "- [~] Doors (2/4)" in lines
+  assert "- [x] Parking brake: confirmed by the driver" in lines
+  assert "- [x] The cancel button disengages: marked while driving, to check in the logs" in lines
+  assert "- [x] 30 min of openpilot steering with no steering fault: seen in the drive logs" in lines
+  assert "## Vehicle state" in lines and "## Lateral control" in lines and "## Submission" not in lines  # no mission of it here
+  assert run("approvalReport", {"missions": [_m("x", "parado")]}, {}, []) == ""  # the Haval build: no approval trails
+
+
 def test_the_level_and_what_moved_after_a_drive():
   before = run("missionProgress", CAT, {}, [])
   after = run("missionProgress", CAT, {"pending": [{"key": "fila"}]}, [trip(slow=650, commit="b3ac6fe")])
@@ -584,6 +640,49 @@ def test_copy_keeps_a_path_only_with_the_maps_option_on():  # owner, 03/11 (D2):
   got = {"points": [[1, 2, 0, 0]], "v": "p1"}
   assert run("keepPath", got, False) is None and run("keepPath", got, None) is None
   assert run("keepPath", got, True) == got and run("keepPath", {"status": "none"}, True) is None
+
+
+TRIP = {"id": "00000040--a1", "segments": [0, 1, 2]}
+SUM = {"km": 3.2, "s": 180, "moving_s": 150, "on_s": 120, "driver": 1, "gas": 0, "brake": 2, "off": 1, "marks": 1}
+EVENTS = [{"t": 61.5, "kind": "mark", "text": "bandeira", "mono_ns": 123, "n": 1}, {"t": 70, "kind": "off", "text": "desengatou", "v": 31},
+          {"t": 80, "kind": "driver", "text": "você no volante"}, {"t": 90, "kind": "hardbrake", "text": "freada forte"}]
+POINTS = [{"t": 0, "v": 10, "on": True, "who": "op", "step": 1, "dpsi": 0, "lat": 0.001, "lon": 0.002, "n": 0},
+          {"t": 1, "v": 11, "on": True, "who": "op", "step": 1, "dpsi": 0, "lat": 0.0011, "lon": 0.002, "n": 0}]
+
+
+def test_ride_keeps_the_numbers_and_the_shown_events_never_a_position():  # APP-02: Rever viagem without the comma
+  kept = run("rideKeep", TRIP, SUM, EVENTS, POINTS, False, 1000)
+  assert kept["map"] is None
+  ride = kept["ride"]
+  assert ride["v"] == "0,1,2" and ride["at"] == 1000 and ride["summary"] == SUM
+  assert ride["events"] == [{"t": 61.5, "kind": "mark", "text": "bandeira"}, {"t": 70, "kind": "off", "text": "desengatou"},
+                            {"t": 90, "kind": "hardbrake", "text": "freada forte"}]  # what viagens.html lists (SHOWN), nothing else
+  assert "lat" not in json.dumps(ride) and "points" not in ride
+
+
+def test_ride_keeps_the_map_only_with_the_maps_option_on():  # D2: the minutes have positions
+  assert run("rideKeep", TRIP, SUM, EVENTS, POINTS, True, 1)["map"] == {"v": "0,1,2", "points": POINTS}
+  assert run("rideKeep", TRIP, SUM, EVENTS, POINTS[:1], True, 1)["map"] is None  # one point draws nothing
+  assert run("rideKeep", TRIP, SUM, EVENTS, None, True, 1)["map"] is None
+  assert run("rideKeep", None, {}, None, None, True, 1)["ride"] == {"v": "", "at": 1, "summary": {}, "events": []}
+
+
+def test_ride_map_key_leaves_with_the_other_maps():  # index.html drops every "path:" key when the option goes off
+  keys = run("rideKeys", "00000040--a1")
+  assert keys == {"ride": "ride:00000040--a1", "map": "path:00000040--a1#min"}
+  assert keys["map"].startswith("path:") and not keys["ride"].startswith("path:")
+
+
+def test_ride_order_newest_first_and_the_oldest_leave():
+  assert run("rideOrder", None, "a") == {"order": ["a"], "drop": []}
+  assert run("rideOrder", ["b", "a", "c"], "a") == {"order": ["a", "b", "c"], "drop": []}
+  assert run("rideOrder", ["c", "b", "a"], "d", 3) == {"order": ["d", "c", "b"], "drop": ["a"]}
+  assert run("rideOrder", list(map(str, range(30))), "x")["drop"] == ["29"]  # RIDE_KEEP: 30 drives kept
+
+
+def test_map_count_one_per_drive():
+  assert run("mapCount", ["trips", "path:a", "path:a#min", "path:b#min", "ride:a", "rides"]) == 2
+  assert run("mapCount", []) == 0 and run("mapCount", None) == 0
 
 
 def test_copy_read_only_without_the_comma_or_before_its_first_answer():
