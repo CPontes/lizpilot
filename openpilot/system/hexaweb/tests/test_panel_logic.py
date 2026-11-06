@@ -394,7 +394,7 @@ def test_unpairing_leaves_no_list_of_drives_on_the_phone():
   assert "LPL.DATA_KEYS" in wipe and "trips = null" in wipe and "paths.clear()" in wipe
   keys = subprocess.run([NODE, "-e", f"process.stdout.write(JSON.stringify(require({json.dumps(str(LOGIC))}).DATA_KEYS))"],
                         capture_output=True, text=True, timeout=30, check=True).stdout
-  assert set(json.loads(keys)) == {"lpTrips", "lpMissionSnap", "lpCopEvents", "lpCopAnswers"}  # data only: the language and the view stay
+  assert set(json.loads(keys)) == {"lpTrips", "lpMissionSnap", "lpCopEvents", "lpCopAnswers", "lpCopTally"}  # data only: the language and the view stay
 
 
 def test_no_path_yet_is_not_no_gps():
@@ -1174,3 +1174,81 @@ def test_the_page_behind_a_layer_stays_put():
   layers = re.findall(r'<section class="(?:sheet|cop)[^"]*" id="(\w+)"', html)
   assert len(layers) >= 8 and "copSheet" in layers and "markSheet" in layers  # the observer watches them all, present and future, by class
   assert 'class="row cophead"' in html  # the copilot's title and Fechar stay on top while its list scrolls
+
+
+def test_the_map_centres_and_reads_back_the_place_under_the_pin():
+  v = run("mapCenter", -22.9035, -43.1091, 16, 430, 600)
+  assert v["z"] == 16 and abs(v["size"] - 256) < 1e-6
+  js = "const L = require(" + json.dumps(str(LOGIC)) + ");" + """ const v = L.mapCenter(-22.9035, -43.1091, 16.5, 430, 600);
+  const c = L.mapXY(v, -22.9035, -43.1091); const back = L.mapLatLon(v, c[0], c[1]); const moved = L.mapLatLon(v, c[0] + 100, c[1]);
+  process.stdout.write(JSON.stringify({ c, back, moved }));"""
+  out = json.loads(subprocess.run([NODE, "-e", js], capture_output=True, text=True, timeout=30, check=True).stdout)
+  assert [round(x) for x in out["c"]] == [215, 300]  # the centre is the middle of the box
+  assert out["back"] == [-22.9035, -43.1091] and out["moved"][1] > -43.1091  # dragged right of the middle: further east
+  assert 1100 < run("distanceM", [-22.9035, -43.1091], [-22.9135, -43.1091]) < 1120  # 0.01° of latitude, ~1.1 km
+
+
+def test_a_place_reads_short():
+  # owner's print, 05/11: the whole Nominatim name over the title
+  long = "Estrada Leopoldo Fróes, São Francisco, Região Praias da Baía, Niterói, Rio de Janeiro, Região Sudeste, 24360-022, Brasil"
+  assert run("shortPlace", long) == {"title": "Estrada Leopoldo Fróes", "sub": "São Francisco, Niterói"}
+  assert run("shortPlace", "Praia de Icaraí, Icaraí, Niterói") == {"title": "Praia de Icaraí", "sub": "Icaraí, Niterói"}
+  assert run("shortPlace", "-22.90350, -43.10910") == {"title": "-22.90350, -43.10910", "sub": ""}
+  assert [run("maneuverKind", *a) for a in [("turn", "right"), ("turn", "slight left"), ("arrive", ""), ("turn", "uturn"), ("depart", "")]] == \
+    ["right", "slight-left", "arrive", "uturn", "straight"]
+
+
+def test_the_route_lives_on_the_mapa_and_every_change_asks():
+  # owner, 05/11: the route card had taken Início's top and hid the driver's panel; "toque e segure" doesn't exist on iOS
+  html = (LOGIC.parent / "index.html").read_text()
+  assert 'id="navCard"' not in html and 'id="homeSeg"' in html and 'data-home="mapa"' in html
+  assert "contextmenu" not in html and "prompt(" not in html[html.index("// ----- the route"):html.index("// ----- the road's limit")]
+  js = html[html.index("// ----- the route"):html.index("// ----- the road's limit")]
+  assert js.count("navConfirm(") >= 4  # go, change, end; andando the passenger first (askPassenger inside navConfirm)
+  assert "if (passengerFirst && askPassenger(() => askSheet(title, what, ok, run, passengerFirst))) return;" in js
+  assert "askSheet(title, what, ok, run, true)" in js
+  assert 'b.addEventListener("click", () => openPick(p));' in js  # a saved place opens "É aqui?", it never goes straight
+  assert 'id="navToken"' in html[html.index('data-subview="comma"'):]  # the Mapbox key went to Ajustes → Comma
+
+
+def test_usar_and_melhorar_one_app_and_the_sending_follows():
+  # owner, 05/11: a switch, not a level; Usar shows the panel, the map and the drives; Melhorar the whole app; the sending follows
+  assert [run("appMode", m, e) for m, e in [(None, "generic"), (None, "h6gt"), ("usar", "h6gt"), ("melhorar", "generic"), ("x", None)]] == \
+    ["usar", "melhorar", "usar", "melhorar", "melhorar"]
+  opt = {"key": "HexaShareEnabled", "value": False, "writable": True}
+  assert run("shareFor", "melhorar", opt) is True and run("shareFor", "usar", opt) is None
+  assert run("shareFor", "usar", {**opt, "value": True}) is False and run("shareFor", "melhorar", None) is None  # no such option: nothing
+  assert run("shareFor", "melhorar", {**opt, "writable": False}) is None
+  html = (LOGIC.parent / "index.html").read_text()
+  assert "body.usar nav.tabs .fab, body.usar nav.tabs [data-go=\"pontos\"], body.usar .melhorar-only { display: none !important; }" in html
+  for idn in ("pendingCard", "missionCard", "kpiBox", "driveMissions", "driveMore", "nextActs", "marksJump"):
+    tag = html[html.rindex("<", 0, html.index(f'id="{idn}"')):html.index(">", html.index(f'id="{idn}"'))]
+    assert "melhorar-only" in tag, idn
+  js = html[html.index("// ----- Usar | Melhorar"):html.index("// ----- the route")]
+  assert 'if (m === "usar") { setMode("usar"); return; }' in js and "askSheet(t(\"Ajudar a melhorar o LizPilot?\")" in js  # in asks, out doesn't
+
+
+def test_the_copilot_is_a_panel_and_the_avisos_count_the_answers():
+  # owner, 05/11: with no event the copilot shows how the car is driving; "pode silenciar" after 20 answers, all "deu certo"
+  t = run("tallyAdd", {}, "stop_lead", "ok")
+  for _ in range(19):
+    t = run("tallyAdd", t, "stop_lead", "ok")
+  assert t == {"stop_lead": {"ok": 20, "bad": 0}} and run("canSilence", t["stop_lead"]) is True
+  assert run("canSilence", {"ok": 30, "bad": 1}) is False and run("canSilence", {"ok": 19, "bad": 0}) is False
+  assert run("tallyAdd", t, "stop_lead", "nao") == t and run("tallyAdd", {}, "x", "ok") == {}  # "Não aconteceu" and unknown kinds count nothing
+  html = (LOGIC.parent / "index.html").read_text()
+  assert 'renderCopLive(v.main);' in html and ': copReview ? waitCard(now) : el("span", "")' in html  # no event: the panel, not "Esperando"
+  assert 'sw.addEventListener("click", () => { closeAvisos(); openMute(kind, on); });' in html  # on or off, it asks first
+  keys = json.loads(subprocess.run([NODE, "-e", f"process.stdout.write(JSON.stringify(require({json.dumps(str(LOGIC))}).DATA_KEYS))"],
+                                   capture_output=True, text=True, timeout=30, check=True).stdout)
+  assert "lpCopTally" in keys  # "Apagar dados deste celular" takes the counts too
+
+
+def test_pular_is_in_the_card_and_the_list_is_one_line_while_driving():
+  # owner, 05/11: "tem que ter um pular" in the card; "a lista embaixo de eventos antigos [...] está muito grande"
+  html = (LOGIC.parent / "index.html").read_text()
+  card = html[html.index("function evCard("):html.index("function waitCard(")]
+  assert 'skip = el("button", "evthird", t("Pular"))' in card and "evSkip(ev)" in card and "EV_TAP_GUARD_MS" in card
+  assert 'id="copSkip"' not in html  # one Pular, in the card, next to the third answer
+  cop = html[html.index("function renderCop()"):]
+  assert "if (v.pending.length && !copReview && !evListOpen)" in cop and "evListOpen, L()]" in cop

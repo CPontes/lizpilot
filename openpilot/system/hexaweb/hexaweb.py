@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from openpilot.selfdrive.hexa import comma_ctl
+from openpilot.selfdrive.hexa import edition as hexa_edition
 from openpilot.selfdrive.hexa import i18n
 from openpilot.selfdrive.hexa import live as hexa_live
 from openpilot.selfdrive.hexa import marks as hexa_marks
@@ -282,6 +283,7 @@ class PanelBackend:
           "branch": self.store.get("GitBranch") or "",
           "commit": (self.store.get("GitCommit") or "")[:7],
           "version": self.store.get("Version") or "",
+          "edition": hexa_edition.EDITION,  # the phone's first Usar | Melhorar: Usar on LizPilot for every car
         },
         "vehicle": {"onroad": vs.onroad, "parked": vs.parked, "standstill": vs.standstill, "engaged": vs.engaged},
         "groups": groups,
@@ -1300,8 +1302,10 @@ class PanelBackend:
 
   def nav_state(self) -> dict:
     n = self.navigator
+    near = n.position()  # the car on the phone's Mapa and the distance to each result; the drives already show the paths
     return {"enabled": n.enabled(), "destination": n.destination(), "places": n.places(),
-            "token": bool(self.store.get(hexa_nav.TOKEN_PARAM)), "route": self._route_state()}
+            "token": bool(self.store.get(hexa_nav.TOKEN_PARAM)), "route": self._route_state(),
+            "near": [round(near[0], 4), round(near[1], 4)] if near else None}
 
   def _nav(self, fn) -> tuple[int, dict]:
     try:
