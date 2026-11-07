@@ -376,13 +376,33 @@ def test_the_pages_finish_what_hiding_a_drive_starts():
   static = Path(__file__).parents[1] / "static"
   html, trip = (static / "index.html").read_text(), (static / "viagens.html").read_text()
   assert 'trip_hidden: "ocultou uma viagem"' in html and 'trip_shown: "mostrou uma viagem de novo"' in html
-  assert "Todas as viagens estão ocultas." in trip and "sel.options.length" in trip  # with all of them hidden it stayed on loading
+  assert "Todas as viagens estão ocultas." in trip and "if (!order.length)" in trip  # with all of them hidden it stayed on loading
   assert "Desde sempre" not in html  # the sums only reach the drives whose logs are still on the comma
 
 
 def test_a_hard_brake_shows_on_its_trip_page():
   trip = (Path(__file__).parents[1] / "static" / "viagens.html").read_text()
   assert 'const SHOWN = ["mark", "off", "hardbrake"];' in trip and 'e.kind !== "mark" && e.kind !== "off"' not in trip
+
+
+def test_mapux_rever_viagem_reads_like_the_inicio_card():
+  # owner's D6 (MAP-UX-01, 06/11): one language for a drive. Who drove in Início's three colours; the bar and the list in clock time
+  assert [run("rideWho", p) for p in ({"who": "op"}, {"who": "wheel"}, {"who": "gas"}, {"who": "brake"}, {"who": "pedal"}, {"who": "you"},
+                                      {"on": True}, {"on": False}, None)] == ["op", "help", "help", "help", "help", "you", "op", "you", "you"]
+  trip = {"mtime": 10_000, "minutes": 10, "segments": [2, 3]}  # the deleter took minutes 0 and 1: the list starts at minute 2
+  assert run("rideClock", trip, 120) == 10_000 - 600 and run("rideClock", trip, 150) == 10_000 - 600 + 30
+  assert run("rideClock", trip, run("pathSecond", trip, 9_700)) == 9_700  # pathSecond's inverse
+  page = (Path(__file__).parents[1] / "static" / "viagens.html").read_text()
+  assert "toFixed(" not in page and "<select" not in page  # numbers in the phone's language; ‹ i de N › as on Início, no list box
+  assert "LPL.listed(all)" in page  # the same drives as Início's ‹ 1 de N ›: not hidden, not idle
+  assert '<i class="sw help"></i><span data-t>com a sua ajuda</span>' in page and "LPL.rideWho(points[i])" in page
+  assert 'localStorage.getItem("lpStreets") === "1"' in page and 'localStorage.setItem("lpStreets"' in page  # Ruas: one switch for both pages
+  assert "LPL.mapFit(ll, w, h, 26)" in page and 'im.referrerPolicy = "strict-origin"' in page
+  # hiding is a change: it asks in the page first
+  assert '$("hideTrip").addEventListener("click", () => {' in page and '$("hideOk").addEventListener("click", async () => {' in page
+  assert page.index('$("hideTrip").addEventListener') < page.index('fetch("/api/trip/hide"') and "hideAsk" in page
+  html = (Path(__file__).parents[1] / "static" / "index.html").read_text()
+  assert '<a class="btn dark" id="tripOpen" href="/viagens">' in html  # Rever viagem is a button on Início's card
 
 
 def test_unpairing_leaves_no_list_of_drives_on_the_phone():
@@ -568,6 +588,24 @@ def test_a_new_cars_approval_and_its_report():  # MISS-01 B, the generic edition
   assert "- [x] 30 min of openpilot steering with no steering fault: seen in the drive logs" in lines
   assert "## Vehicle state" in lines and "## Lateral control" in lines and "## Submission" not in lines  # no mission of it here
   assert run("approvalReport", {"missions": [_m("x", "parado")]}, {}, []) == ""  # the Haval build: no approval trails
+
+
+def test_the_calibration_trail_from_what_the_comma_learned():  # MISS-01 C
+  ms = [_m("cam", "auto", detect="calibrated"), _m("rel", "auto", detect="ratio"), _m("tq", "auto", detect="torque"),
+        _m("rodas", "auto", detect="wheels_gps")]
+  cat = {"levels": CAT["levels"], "trails": [], "missions": ms}
+
+  def drive(**cb):
+    t = trip()
+    t["summary"].update(cb)
+    return t
+  p = run("missionProgress", cat, {}, [drive(cb_calibrated=1, cb_sr=18.4, cb_sr_km=25, cb_tq_perc=100, cb_v_n=900, cb_v_wheel=18000,
+                                             cb_v_gps=17800)])
+  assert all(p[k]["full"] for k in ("cam", "rel", "tq", "rodas"))
+  p = run("missionProgress", cat, {}, [drive(cb_calibrated=0, cb_sr=18.4, cb_sr_km=10, cb_tq_perc=96, cb_v_n=900, cb_v_wheel=18000,
+                                             cb_v_gps=17000)])
+  assert not any(p[k]["full"] for k in ("cam", "rel", "tq", "rodas"))  # not yet; 10 km; 96%; the wheels 5.9% over the GPS
+  assert not run("missionProgress", cat, {}, [drive(cb_v_n=100, cb_v_wheel=2000, cb_v_gps=2000)])["rodas"]["full"]  # 10 s only
 
 
 def test_the_level_and_what_moved_after_a_drive():
@@ -1313,9 +1351,10 @@ def test_the_route_lives_on_the_mapa_and_every_change_asks():
   assert "contextmenu" not in html and "prompt(" not in html[html.index("// ----- the route"):html.index("// ----- the road's limit")]
   js = html[html.index("// ----- the route"):html.index("// ----- the road's limit")]
   assert js.count("navConfirm(") >= 3 and "openGo(" in js  # change, end; "Ir para cá" asks which app; andando the passenger first
-  assert "if (passengerFirst && askPassenger(() => askSheet(title, what, ok, run, passengerFirst))) return;" in js
-  assert "askSheet(title, what, ok, run, true)" in js
-  assert 'b.addEventListener("click", () => openPick(p));' in js  # a saved place opens "É aqui?", it never goes straight
+  assert 'askPassenger(() => askSheet(title, what, ok, run, passengerFirst), false, passengerFirst === "mapa" ? "mapa" : undefined)) return;' in js
+  assert 'askSheet(title, what, ok, run, "mapa")' in js
+  # owner's D2 (MAP-UX-01, 06/11): a saved place goes straight to "Quem mostra o caminho", the box that confirms; never straight to a route
+  assert 'b.addEventListener("click", () => goFromList(p));' in js and "openGo({ ...navPickP });" in js[js.index("function goFromList("):]
   assert 'id="navToken"' in html[html.index('data-subview="comma"'):]  # the Mapbox key went to Ajustes → Comma
 
 
@@ -1362,6 +1401,88 @@ def test_pular_is_in_the_card_and_the_list_is_one_line_while_driving():
   assert "if (v.pending.length && !copReview && !evListOpen)" in cop and "evListOpen, L()]" in cop
 
 
+def _js(expr: str):
+  script = f"const L = require({json.dumps(str(LOGIC))}); process.stdout.write(JSON.stringify({expr}));"
+  return json.loads(subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout)
+
+
+def test_mapux_quem_mostra_o_caminho_puts_the_last_choice_first_and_says_why_the_comma_is_off():
+  # owner's D4 and D5 (MAP-UX-01, 06/11): asked every time, the last choice first and the only green one; the comma always listed
+  first = run("navOptions", None, True)
+  assert [o["app"] for o in first] == ["waze", "google", "comma"] and [o["main"] for o in first] == [True, False, False]
+  assert not any(o["last"] for o in first)  # nothing chosen yet: no "da última vez"
+  last = run("navOptions", "google", True)
+  assert [o["app"] for o in last] == ["google", "waze", "comma"] and last[0]["last"] and last[0]["main"] and not last[1]["main"]
+  off = run("navOptions", "comma", False)  # the comma's route was the last one, but its navigation is off now: listed, off, not first
+  assert [o["app"] for o in off] == ["waze", "google", "comma"] and off[2] == {"app": "comma", "on": False, "last": False, "main": False}
+  assert run("navOptions", "outro", True)[0]["app"] == "waze" and all(o["on"] for o in run("navOptions", None, True))
+  assert run("navChoice", "google", True) is None  # still asks every time (05/11)
+
+
+def test_mapux_the_same_place_is_within_20_m_and_a_saved_one_is_known():
+  a = {"latitude": -15.8052, "longitude": -47.8924}
+  assert run("samePoint", a, {"latitude": -15.80525, "longitude": -47.89245}) is True
+  assert run("samePoint", a, {"latitude": -15.8062, "longitude": -47.8924}) is False and run("samePoint", a, None) is False
+  places = [{"name": "Casa", "latitude": -15.7801, "longitude": -47.9292}]
+  assert run("savedPlace", places, {"name": "Rua X, Asa Norte", "latitude": -15.78011, "longitude": -47.92921})["name"] == "Casa"
+  assert run("savedPlace", places, a) is None and run("savedPlace", None, a) is None
+
+
+def test_mapux_the_mapa_shows_the_recent_places_not_the_saved_ones():
+  # step 1: the saved places are the chips on top; the card lists the last places gone to, at most 3, and the way to edit the saved ones
+  casa = {"name": "Casa", "latitude": -15.7801, "longitude": -47.9292}
+  rec = [{"name": "Casa, Asa Norte", "latitude": -15.7801, "longitude": -47.9292}] + \
+        [{"name": f"R{i}", "latitude": -15.7 - i / 100, "longitude": -47.9} for i in range(4)]
+  m = run("mapCard", rec, [casa])
+  assert [p["name"] for p in m["recent"]] == ["R0", "R1", "R2"] and m["edit"] is True and m["empty"] is False
+  assert run("mapCard", [], []) == {"recent": [], "edit": False, "empty": True}  # nothing yet: the card says what can be done
+  assert run("mapCard", None, [casa]) == {"recent": [], "edit": True, "empty": False}
+
+
+def test_mapux_the_pin_sits_where_the_card_leaves_room():
+  # step 4: the place in the middle of what the bar on top and the card below leave, never under the card; the pin is 52 px tall
+  y = run("pinSpot", 600, 62, 220)
+  assert y == 62 + (600 - 62 - 220) // 2 + 26 and 62 + 52 <= y <= 600 - 220
+  assert run("pinSpot", 600, 300, 260) == 340  # a small phone, 40 px between them: the tip on the card's edge, never under it
+  assert run("pinSpot", 600, 300, 320) == 300  # nothing of the map shows: the middle, as before
+  c = run("centerAt", -15.8052, -47.8924, 16.5, 390, 600, 195, y)
+  xy = _js(f"L.mapXY(L.mapCenter({c['lat']}, {c['lon']}, {c['zf']}, 390, 600), -15.8052, -47.8924)")
+  assert abs(xy[0] - 195) < 1 and abs(xy[1] - y) < 1  # the map is centred so that the place is right under the pin's tip
+
+
+def test_mapux_the_route_fits_where_nothing_covers_it():
+  # step 6: the whole route between the bar on top, the card below and the zoom buttons on the right
+  path = [[-15.7939, -47.8828], [-15.7939, -47.8924], [-15.8052, -47.8924]]
+  band = {"top": 140, "bottom": 230, "right": 64}
+  fit = f"L.fitBand({json.dumps(path)}, 390, 600, {json.dumps(band)}, 26)"
+  xy = _js(f"((f) => {json.dumps(path)}.map((p) => L.mapXY(L.mapCenter(f.lat, f.lon, f.zf, 390, 600), p[0], p[1])))({fit})")
+  assert all(25 <= x <= 390 - 64 - 25 and 140 + 25 <= y <= 600 - 230 - 25 for x, y in xy), xy
+  assert run("fitBand", [], 390, 600, band, 26) is None
+
+
+def test_mapux_the_mapa_is_the_passengers_and_every_change_still_confirms():
+  html = (LOGIC.parent / "index.html").read_text()
+  js = html[html.index("// ----- the route"):html.index("// ----- the road's limit")]
+  # owner's D1: the Mapa's tab and the route's line ask first, once per trip, with the Mapa's words; Marcar keeps its own
+  assert "e.target.closest('[data-home=\"mapa\"], [data-navline]')" in html and 'askPassenger(() => b.click(), false, "mapa")' in html
+  assert 't("Com o carro andando, o mapa é do passageiro")' in html and 'id="passWhat"' in html
+  assert 't("Quem dirige olha a estrada. O que você tocou já está guardado: a hora ou o lugar.")' in html
+  # andando, everything that changes something asks first too (the phone may already be on the Mapa when the car leaves)
+  for guard in ('if (askPassenger(() => openGo(p), false, "mapa")) return;', 'if (askPassenger(() => goFromList(p), false, "mapa")) return;',
+                'if (askPassenger(openSwap, false, "mapa")) return;', 'if (askPassenger(save, false, "mapa")) return;',
+                'function openPlacesAsk() { if (!askPassenger(openPlacesAsk, false, "mapa")) openPlaces(); }',
+                'if (askPassenger(() => navSearch(), false, "mapa")) return;'):
+    assert guard in js, guard
+  # owner's D3: dragging only looks around; the destination moves only under "Ajustar o ponto"
+  assert js.count("navPickP.latitude = at[0]") == 1 and "if (navAdjust) { const at = LPL.mapLatLon(v, w / 2, navAdjust.y);" in js
+  # owner's D5: nothing over the map when the comma's navigation is off: Quem mostra o caminho says it, the option off
+  assert 'id="mapMsg"' not in html and "b.disabled = !o.on;" in js
+  assert ".mapfull.tight .mside { display: none; }" in html  # a small phone: + − ◎ never over the search bar
+  # the destination already set isn't "changed" to itself; Trocar destino lists the saved and the recent places
+  assert 'if (dest && LPL.samePoint(dest, p)) { toast(t("Já é o destino.")); closePick(); return; }' in js
+  assert '$("navChange").addEventListener("click", openSwap);' in js and 'id="swapSheet"' in html
+
+
 def test_ir_para_ca_asks_which_app_every_time():
   # owner, 05/11: Waze or Google Maps navigate (free, no key); the comma's route only with its navigation on; "toda vez [...] pergunta"
   assert run("navTargets", False) == ["waze", "google"] and run("navTargets", True) == ["waze", "google", "comma"]
@@ -1377,4 +1498,72 @@ def test_ir_para_ca_asks_which_app_every_time():
   assert "lpNavRecent" in keys  # where you went: "Apagar dados" takes it
   html = (LOGIC.parent / "index.html").read_text()
   assert '$("pickGo").addEventListener("click", () => { if (navPickP) openGo({ ...navPickP }); });' in html
-  assert "if (askPassenger(() => openGo(p))) return;" in html
+  assert 'if (askPassenger(() => openGo(p), false, "mapa")) return;' in html
+
+
+# ----- Navegar (NAV-03): the route to glance at with the phone on its mount
+
+def test_navegar_opens_when_the_car_starts_moving_with_a_route():
+  # owner, 06/11: moving with a route, Início goes to Navegar; without one, the Mapa gives way to the Painel as before
+  def go(pane, **o):
+    return run("homeFor", pane, {"hasRoute": True, "driving": True, "wasDriving": False, **o})
+  assert go("painel") == "navegar" and go("mapa") == "navegar" and go("navegar") == "navegar"
+  assert go("mapa", hasRoute=False) == "painel" and go("painel", hasRoute=False) == "painel"
+  assert go("mapa", hasRoute=None) == "painel"  # the route not known yet at the start: as before
+  assert go("painel", wasDriving=None) == "painel"  # the page's first look is not a start
+  assert go("painel", wasDriving=True) == "painel" and go("mapa", wasDriving=True) == "mapa"  # already moving: what was picked stays
+  assert go("navegar", hasRoute=False, driving=False) == "painel"  # the route ended
+  assert go("navegar", hasRoute=None, driving=False, wasDriving=None) == "navegar"  # a reload before the comma answered stays
+
+
+def test_navegar_distances_are_big_and_round():
+  got = [run("navDist", m) for m in (0, 4, 346, 994, 996, 1049, 1250, 9949, 9951, 23400, None, -5)]
+  assert [(d["n"], d["unit"], d["dec"]) for d in got] == [
+    (0, "m", 0), (0, "m", 0), (350, "m", 0), (990, "m", 0), (1, "km", 1), (1, "km", 1), (1.3, "km", 1), (9.9, "km", 1),
+    (10, "km", 0), (23, "km", 0), (0, "m", 0), (0, "m", 0)]
+
+
+def test_navegar_shows_navd_route_and_waits_without_it():
+  assert run("navView", {"active": True}, False, T0) is None  # no destination: no Navegar
+  assert run("navView", None, True, T0) == {"wait": True, "turn": None, "arrive": None}
+  assert run("navView", {"active": False}, True, T0) == {"wait": True, "turn": None, "arrive": None}  # navd still computing
+  rt = {"active": True, "next": "Rua Inventada", "then": "Avenida Dois", "type": "turn", "modifier": "slight right",
+        "in_m": 346, "left_m": 8420, "left_s": 754}
+  v = run("navView", rt, True, T0)
+  assert v["wait"] is False
+  assert v["turn"] == {"kind": "slight-right", "dist": {"n": 350, "unit": "m", "dec": 0}, "street": "Rua Inventada", "then": "Avenida Dois"}
+  assert v["arrive"] == {"at": T0 + 754_000, "min": 13, "dist": {"n": 8.4, "unit": "km", "dec": 1}}
+  odd = run("navView", {"active": True, "left_s": -3, "in_m": None, "left_m": None}, True, T0)
+  assert odd["arrive"]["at"] == T0 and odd["arrive"]["min"] == 0 and odd["turn"]["street"] == "" and odd["turn"]["kind"] == "straight"
+
+
+def test_navegar_the_car_ahead_slower_faster_or_the_same():
+  assert run("leadView", live(lead=None)) is None and run("leadView", None) is None
+  slower = run("leadView", live(v=62, lead={"d": 34, "v": 58, "gap": 2.0}))
+  assert slower == {"gap": 2.0, "d": 34, "v": 58, "dv": -4, "how": "{n} km/h mais devagar"}
+  assert run("leadView", live(v=62, lead={"d": 40, "v": 70, "gap": 2.3}))["how"] == "{n} km/h mais rápido"
+  assert run("leadView", live(v=62, lead={"d": 40, "v": 62.4, "gap": 2.3}))["how"] == "mesma velocidade"
+  assert run("leadView", live(v=2, lead={"d": 6, "v": 0, "gap": None}))["gap"] is None  # stopped: no time gap, the distance shows
+
+
+def test_navegar_zooms_out_with_speed():
+  assert [run("navZoom", v) for v in (0, 49, 50, 89, 90, 130)] == [16.5, 16.5, 15.5, 15.5, 14.5, 14.5]
+
+
+def test_navegar_only_reads_and_the_streets_need_the_option():
+  # the rules that stay (NAV-03): no keyboard driving, the street map only with "Mostrar ruas", no camera nor microphone
+  html = (LOGIC.parent / "index.html").read_text()
+  block = html[html.index('<div id="navDrive"'):html.index('<div id="garage">')]
+  assert "<input" not in block and "<textarea" not in block and "<select" not in block and "contenteditable" not in block
+  buttons = re.findall(r"<button[^>]*>", block)
+  assert buttons and all("data-home=" in b for b in buttons)  # the only buttons go to Painel or Mapa
+  js = html[html.index("// ----- Navegar (NAV-03)"):html.index("// one finger moves the map")]
+  assert "api(" not in js and "addEventListener" not in js and "focus(" not in js  # reads navState and live; asks and sends nothing
+  assert "if (v && streets) for (const tl of LPL.mapTiles(v, w, h))" in js
+  assert "near.near.find((p) => p.ahead)" in js  # it opens by itself: the Painel's next radar or bump can't disappear with it
+  assert "getUserMedia" not in html and "webrtc" not in html.lower()
+  seg = html[html.index('id="homeSeg"'):html.index('id="mapPane"')]
+  assert seg.index('data-home="painel"') < seg.index('data-home="navegar"') < seg.index('data-home="mapa"')
+  assert 'class="hidden" data-home="navegar"' in seg  # shown by renderNav only with a destination
+  nav = html[html.index("function renderNav()"):html.index("function mapHome()")]
+  assert 'if (homePane === "navegar" && !dest) { showHome("painel"); return; }' in nav
